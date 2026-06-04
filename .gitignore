@@ -1,0 +1,10 @@
+.claude/
+__pycache__/
+*.pyc
+
+# Ignore ONLY large daily parquet files
+data/raw/daily/*.parquet
+
+# Ignore large numpy file
+data/processed/signatures/signatures.npy
+5
