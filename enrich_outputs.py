@@ -2,27 +2,45 @@
 """
 Add GIS context columns to the correction reports without changing any
 model logic. Reads the latest ServicePoints*.csv and Transformers*.csv in
-GIS_mapping/ and enriches:
+GIS_mapping/ and produces enriched outputs that classify the signal
+quality of each recommendation from the perspective that the model is
+the source of truth and GIS may be incorrect.
 
-    data/outputs/transformer_corrections.csv
-        -> data/outputs/transformer_corrections_enriched.csv
+Outputs:
+    data/outputs/transformer_corrections_enriched.csv
+    data/outputs/corrections_ranked_enriched.csv
+    data/outputs/corrections_with_stability_enriched.csv  (if input exists)
+    data/outputs/badges_missing_from_gis.csv
+        Badges in the signature store that don't appear in ServicePoints.
+        Each row shows the cluster's majority recommendation as a starting
+        point for first-time GIS entry.
+    data/outputs/latlon_discrepancies.csv
+        Badges where the model's lat/lon (from CIS via Oracle SQL) differs
+        from the GIS POINT_X/POINT_Y by more than the threshold (default
+        100 m). These are GIS-side data quality candidates.
 
-    data/outputs/corrections_ranked.csv (if present)
-        -> data/outputs/corrections_ranked_enriched.csv
+Each enriched correction row carries a RECOMMENDATION_TYPE label:
 
-    data/outputs/corrections_with_stability.csv (if present)
-        -> data/outputs/corrections_with_stability_enriched.csv
+    cross_feeder_likely_gis_error
+        Current and recommended transformers are on different feeders.
+        Voltage signatures shouldn't cross feeders; the parsimonious
+        explanation is that GIS has the badge's feeder/transformer wrong.
+        Treat as HIGH-signal.
 
-Added columns:
-    BADGE_ADDRESS, BADGE_CITY, BADGE_LAT, BADGE_LON, BADGE_FEEDERID
-    CURRENT_TX_STRUCTNO, CURRENT_TX_FEEDERID, CURRENT_TX_VAULTCD,
-        CURRENT_TX_LAT, CURRENT_TX_LON, CURRENT_TX_KVA
-    RECOMMENDED_TX_STRUCTNO, RECOMMENDED_TX_FEEDERID, RECOMMENDED_TX_VAULTCD,
-        RECOMMENDED_TX_LAT, RECOMMENDED_TX_LON, RECOMMENDED_TX_KVA
-    DISTANCE_BADGE_TO_CURRENT_M, DISTANCE_BADGE_TO_RECOMMENDED_M
-    FEEDER_MISMATCH  (True if current and recommended TXs are on different feeders)
+    same_feeder_ambiguous
+        Current and recommended transformers are on the same feeder.
+        Same-feeder voltage signatures can look very similar even on
+        different transformers; LOWER-signal on its own. Combine with
+        CONFIDENCE_GAP and stability scores to triage.
 
-This script never touches signatures, clusters, or correlation logic.
+    new_assignment
+        Badge has no current transformer in GIS. The model is suggesting
+        a first-time assignment from cluster majority.
+
+    unknown_feeder
+        Feeder info is missing for one or both transformers; can't classify.
+
+This script never feeds back into correlation or clustering.
 """
 
 import glob
@@ -33,7 +51,17 @@ import pandas as pd
 
 GIS_DIR = "GIS_mapping"
 OUT_DIR = "data/outputs"
+SIG_DIR = "data/processed/signatures"
+
+SIG_BADGE_IDS = os.path.join(SIG_DIR, "badge_ids.npy")
+SIG_LAT = os.path.join(SIG_DIR, "lat.npy")
+SIG_LON = os.path.join(SIG_DIR, "lon.npy")
+
+CLUSTERS = os.path.join(OUT_DIR, "full_clusters.csv")
+KNOWN_MAPPING = os.path.join(OUT_DIR, "known_mapping.csv")
+
 EARTH_R = 6371000.0
+LATLON_DISCREPANCY_THRESHOLD_M = 100.0
 
 
 def find_latest(pattern):
@@ -108,13 +136,6 @@ def load_transformers(path):
 
 
 def build_tx_id_lookup(sp, tx):
-    """
-    Build a (TRANSFORMERBANKOBJECTID -> transformer-info-row) lookup.
-
-    ServicePoints carries both TRANSFORMERBANKOBJECTID (the join key used
-    by known_mapping.csv) and TRANSBANKTAG (the join key to the Transformers
-    file). We use SP as the bridge.
-    """
     bridge = (
         sp[["TRANSFORMERBANKOBJECTID", "TRANSBANKTAG"]]
         .dropna(subset=["TRANSFORMERBANKOBJECTID", "TRANSBANKTAG"])
@@ -125,7 +146,40 @@ def build_tx_id_lookup(sp, tx):
     return tx_with_id
 
 
-def enrich_file(input_path, output_path, sp, tx_lookup):
+def load_model_latlon():
+    if not (
+        os.path.exists(SIG_BADGE_IDS)
+        and os.path.exists(SIG_LAT)
+        and os.path.exists(SIG_LON)
+    ):
+        return None
+    badges = np.load(SIG_BADGE_IDS, allow_pickle=True)
+    lats = np.load(SIG_LAT)
+    lons = np.load(SIG_LON)
+    return pd.DataFrame(
+        {
+            "BADGE": [str(b) for b in badges],
+            "MODEL_BADGE_LAT": lats,
+            "MODEL_BADGE_LON": lons,
+        }
+    )
+
+
+def classify_recommendation(row):
+    cur_feeder = row.get("CURRENT_TX_FEEDERID_RAW")
+    rec_feeder = row.get("RECOMMENDED_TX_FEEDERID_RAW")
+    cur_tx = row.get("CURRENT_TRANSFORMER")
+
+    if pd.isna(cur_tx) or cur_tx == "":
+        return "new_assignment"
+    if pd.isna(cur_feeder) or pd.isna(rec_feeder) or cur_feeder == "" or rec_feeder == "":
+        return "unknown_feeder"
+    if cur_feeder == rec_feeder:
+        return "same_feeder_ambiguous"
+    return "cross_feeder_likely_gis_error"
+
+
+def enrich_file(input_path, output_path, sp, tx_lookup, model_latlon):
     if not os.path.exists(input_path):
         print(f"  Skipping (not present): {input_path}")
         return
@@ -147,13 +201,25 @@ def enrich_file(input_path, output_path, sp, tx_lookup):
         "BADGENUMBER": "BADGE",
         "CCBADDRESS1": "BADGE_ADDRESS",
         "CCBCITY": "BADGE_CITY",
-        "POINT_Y": "BADGE_LAT",
-        "POINT_X": "BADGE_LON",
+        "POINT_Y": "GIS_BADGE_LAT",
+        "POINT_X": "GIS_BADGE_LON",
         "FEEDERID": "BADGE_FEEDERID_RAW",
         "d_FEEDERID": "BADGE_FEEDERID",
     }
     sp_badge = sp[list(sp_badge_cols.keys())].rename(columns=sp_badge_cols)
     df = df.merge(sp_badge, on="BADGE", how="left")
+
+    if model_latlon is not None:
+        df = df.merge(model_latlon, on="BADGE", how="left")
+        df["MODEL_VS_GIS_LATLON_DISTANCE_M"] = haversine_m(
+            df["MODEL_BADGE_LAT"],
+            df["MODEL_BADGE_LON"],
+            df["GIS_BADGE_LAT"],
+            df["GIS_BADGE_LON"],
+        ).round(1)
+        df["LATLON_DISCREPANCY"] = (
+            df["MODEL_VS_GIS_LATLON_DISTANCE_M"] > LATLON_DISCREPANCY_THRESHOLD_M
+        )
 
     cur_cols = {
         "TRANSFORMERBANKOBJECTID": "CURRENT_TRANSFORMER",
@@ -184,39 +250,175 @@ def enrich_file(input_path, output_path, sp, tx_lookup):
     df = df.merge(rec, on="RECOMMENDED_TRANSFORMER", how="left")
 
     df["DISTANCE_BADGE_TO_CURRENT_M"] = haversine_m(
-        df["BADGE_LAT"], df["BADGE_LON"], df["CURRENT_TX_LAT"], df["CURRENT_TX_LON"]
+        df["GIS_BADGE_LAT"],
+        df["GIS_BADGE_LON"],
+        df["CURRENT_TX_LAT"],
+        df["CURRENT_TX_LON"],
     ).round(1)
     df["DISTANCE_BADGE_TO_RECOMMENDED_M"] = haversine_m(
-        df["BADGE_LAT"],
-        df["BADGE_LON"],
+        df["GIS_BADGE_LAT"],
+        df["GIS_BADGE_LON"],
         df["RECOMMENDED_TX_LAT"],
         df["RECOMMENDED_TX_LON"],
     ).round(1)
 
-    df["FEEDER_MISMATCH"] = (
-        df["CURRENT_TX_FEEDERID_RAW"].fillna("")
-        != df["RECOMMENDED_TX_FEEDERID_RAW"].fillna("")
-    )
+    df["RECOMMENDATION_TYPE"] = df.apply(classify_recommendation, axis=1)
 
     df = df.drop(
         columns=[
             c
-            for c in ["BADGE_FEEDERID_RAW", "CURRENT_TX_FEEDERID_RAW", "RECOMMENDED_TX_FEEDERID_RAW"]
+            for c in [
+                "BADGE_FEEDERID_RAW",
+                "CURRENT_TX_FEEDERID_RAW",
+                "RECOMMENDED_TX_FEEDERID_RAW",
+            ]
             if c in df.columns
         ]
     )
 
     df.to_csv(output_path, index=False)
+    type_counts = df["RECOMMENDATION_TYPE"].value_counts().to_dict()
+    print(f"    Wrote {output_path} ({len(df):,} rows)")
+    for k, v in type_counts.items():
+        print(f"      {k}: {v:,}")
+
+
+def write_missing_from_gis(sp, tx_lookup):
+    if not os.path.exists(CLUSTERS):
+        print(f"  Skipping missing-from-GIS report: {CLUSTERS} not found")
+        return
+
+    print("  Building badges_missing_from_gis.csv ...")
+    clusters = pd.read_csv(CLUSTERS, dtype=str)
+    clusters["BADGE"] = clusters["BADGE"].astype(str)
+    sp_badges = set(sp["BADGENUMBER"])
+
+    missing = clusters[~clusters["BADGE"].isin(sp_badges)].copy()
+    if missing.empty:
+        print("    No badges in clusters are missing from GIS.")
+        empty = pd.DataFrame(
+            columns=[
+                "BADGE",
+                "CLUSTER",
+                "CLUSTER_SIZE",
+                "MAPPED_PEERS",
+                "MAJORITY_TRANSFORMER",
+                "MAJORITY_VOTES",
+                "MAJORITY_SHARE",
+            ]
+        )
+        empty.to_csv(os.path.join(OUT_DIR, "badges_missing_from_gis.csv"), index=False)
+        return
+
+    truth = pd.read_csv(KNOWN_MAPPING, dtype=str).rename(
+        columns={"badge": "BADGE", "transf_id": "TRANSFORMER"}
+    )
+    truth["TRANSFORMER"] = normalize_id(truth["TRANSFORMER"])
+    joined = clusters.merge(truth, on="BADGE", how="left")
+    mapped = joined.dropna(subset=["TRANSFORMER"])
+
+    cluster_size = (
+        clusters.groupby("CLUSTER").size().rename("CLUSTER_SIZE").reset_index()
+    )
+    mapped_size = (
+        mapped.groupby("CLUSTER").size().rename("MAPPED_PEERS").reset_index()
+    )
+    votes_per_tx = (
+        mapped.groupby(["CLUSTER", "TRANSFORMER"]).size().rename("VOTES").reset_index()
+    )
+
+    majority = (
+        votes_per_tx.sort_values("VOTES", ascending=False)
+        .drop_duplicates(subset=["CLUSTER"], keep="first")
+        .rename(
+            columns={
+                "TRANSFORMER": "MAJORITY_TRANSFORMER",
+                "VOTES": "MAJORITY_VOTES",
+            }
+        )
+    )
+
+    out = missing[["BADGE", "CLUSTER"]].merge(cluster_size, on="CLUSTER", how="left")
+    out = out.merge(mapped_size, on="CLUSTER", how="left")
+    out = out.merge(majority, on="CLUSTER", how="left")
+    out["MAPPED_PEERS"] = out["MAPPED_PEERS"].fillna(0).astype(int)
+    out["MAJORITY_VOTES"] = out["MAJORITY_VOTES"].fillna(0).astype(int)
+    denom = out["MAPPED_PEERS"].astype(float).replace(0, np.nan)
+    out["MAJORITY_SHARE"] = (out["MAJORITY_VOTES"].astype(float) / denom).round(3)
+
+    rec_cols = {
+        "TRANSFORMERBANKOBJECTID": "MAJORITY_TRANSFORMER",
+        "STRUCTNO": "RECOMMENDED_TX_STRUCTNO",
+        "d_FEEDERID": "RECOMMENDED_TX_FEEDERID",
+        "VAULTCD": "RECOMMENDED_TX_VAULTCD",
+        "POINT_Y": "RECOMMENDED_TX_LAT",
+        "POINT_X": "RECOMMENDED_TX_LON",
+        "TOTALKVA": "RECOMMENDED_TX_KVA",
+    }
+    rec = tx_lookup[list(rec_cols.keys())].rename(columns=rec_cols)
+    out = out.merge(rec, on="MAJORITY_TRANSFORMER", how="left")
+
+    out = out.sort_values(
+        ["MAJORITY_SHARE", "MAPPED_PEERS"], ascending=[False, False]
+    )
+    out.to_csv(os.path.join(OUT_DIR, "badges_missing_from_gis.csv"), index=False)
+    print(f"    Wrote {len(out):,} badges missing from GIS")
+
+
+def write_latlon_discrepancies(sp, model_latlon):
+    if model_latlon is None:
+        print(
+            "  Skipping latlon_discrepancies.csv: model lat/lon arrays not found"
+        )
+        return
+
+    print("  Building latlon_discrepancies.csv ...")
+    gis = sp[["BADGENUMBER", "POINT_X", "POINT_Y", "CCBADDRESS1", "CCBCITY"]].rename(
+        columns={
+            "BADGENUMBER": "BADGE",
+            "POINT_Y": "GIS_BADGE_LAT",
+            "POINT_X": "GIS_BADGE_LON",
+            "CCBADDRESS1": "BADGE_ADDRESS",
+            "CCBCITY": "BADGE_CITY",
+        }
+    )
+    merged = model_latlon.merge(gis, on="BADGE", how="inner")
+    merged["MODEL_VS_GIS_LATLON_DISTANCE_M"] = haversine_m(
+        merged["MODEL_BADGE_LAT"],
+        merged["MODEL_BADGE_LON"],
+        merged["GIS_BADGE_LAT"],
+        merged["GIS_BADGE_LON"],
+    ).round(1)
+
+    discrepant = merged[
+        merged["MODEL_VS_GIS_LATLON_DISTANCE_M"] > LATLON_DISCREPANCY_THRESHOLD_M
+    ].copy()
+    discrepant = discrepant.sort_values(
+        "MODEL_VS_GIS_LATLON_DISTANCE_M", ascending=False
+    )
+
+    cols = [
+        "BADGE",
+        "BADGE_ADDRESS",
+        "BADGE_CITY",
+        "MODEL_BADGE_LAT",
+        "MODEL_BADGE_LON",
+        "GIS_BADGE_LAT",
+        "GIS_BADGE_LON",
+        "MODEL_VS_GIS_LATLON_DISTANCE_M",
+    ]
+    discrepant[cols].to_csv(
+        os.path.join(OUT_DIR, "latlon_discrepancies.csv"), index=False
+    )
     print(
-        f"    Wrote {output_path} ({len(df):,} rows, "
-        f"feeder mismatches: {df['FEEDER_MISMATCH'].sum():,})"
+        f"    Wrote {len(discrepant):,} badges with model vs GIS distance > "
+        f"{LATLON_DISCREPANCY_THRESHOLD_M:.0f} m"
     )
 
 
 def main():
     sp_path = find_latest("ServicePoints*.csv")
     tx_path = find_latest("Transformers*.csv")
-
     if sp_path is None:
         raise SystemExit(f"No ServicePoints*.csv found in {GIS_DIR}/")
     if tx_path is None:
@@ -228,22 +430,33 @@ def main():
     sp = load_service_points(sp_path)
     tx = load_transformers(tx_path)
     tx_lookup = build_tx_id_lookup(sp, tx)
+    model_latlon = load_model_latlon()
     print(
         f"  {len(sp):,} unique ServicePoints | "
         f"{len(tx):,} unique Transformers | "
         f"{len(tx_lookup):,} TRANSFORMERBANKOBJECTIDs joinable to Transformer rows"
     )
+    if model_latlon is not None:
+        print(f"  {len(model_latlon):,} badges with model lat/lon loaded")
 
     inputs = [
         ("transformer_corrections.csv", "transformer_corrections_enriched.csv"),
         ("corrections_ranked.csv", "corrections_ranked_enriched.csv"),
         ("corrections_with_stability.csv", "corrections_with_stability_enriched.csv"),
     ]
-    print("Enriching outputs:")
+    print("Enriching correction outputs:")
     for inp, outp in inputs:
         enrich_file(
-            os.path.join(OUT_DIR, inp), os.path.join(OUT_DIR, outp), sp, tx_lookup
+            os.path.join(OUT_DIR, inp),
+            os.path.join(OUT_DIR, outp),
+            sp,
+            tx_lookup,
+            model_latlon,
         )
+
+    print("Producing supplementary reports:")
+    write_missing_from_gis(sp, tx_lookup)
+    write_latlon_discrepancies(sp, model_latlon)
 
 
 if __name__ == "__main__":
