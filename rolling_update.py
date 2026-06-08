@@ -56,10 +56,14 @@ def main(new_day_parquet):
             "NOMINAL",
         ],
     )
-    new_df["BADGE"] = new_df["BADGE"].astype(str)
+    # Cast wide-string columns to category early — drops the BADGE column
+    # alone from ~1.6 GB (20M rows × ~80 bytes/object) to ~40 MB on a typical
+    # day, which makes groupby allocations fit easily.
+    new_df["BADGE"] = new_df["BADGE"].astype(str).astype("category")
+    new_df["DEVICE_TYPE_CD"] = new_df["DEVICE_TYPE_CD"].astype("category")
     new_df["MSRMTDTTM"] = pd.to_datetime(new_df["MSRMTDTTM"], utc=True)
 
-    new_badges_set = set(new_df["BADGE"].unique())
+    new_badges_set = set(new_df["BADGE"].cat.categories.astype(str))
     added = sorted(new_badges_set - old_badges_set)
     removed = sorted(old_badges_set - new_badges_set)
     print(f"Added badges: {len(added)}")
@@ -97,14 +101,16 @@ def main(new_day_parquet):
     del old_signatures
     gc.collect()
 
-    print("Writing new day columns ...")
+    print("Writing new day columns and collecting metadata in one pass ...")
     day_start = new_df["MSRMTDTTM"].min().floor("D")
     times = pd.date_range(
         start=day_start, periods=INTERVALS_PER_DAY, freq="15min", tz="UTC"
     )
 
-    for badge, g in new_df.groupby("BADGE", sort=False):
-        i = badge_index.get(badge)
+    meta_rows = []
+    for badge, g in new_df.groupby("BADGE", sort=False, observed=True):
+        badge_str = str(badge)
+        i = badge_index.get(badge_str)
         if i is None:
             continue
         g = g.sort_values("MSRMTDTTM").drop_duplicates(
@@ -112,25 +118,28 @@ def main(new_day_parquet):
         )
         ts = g.set_index("MSRMTDTTM")["PUVALUE"].reindex(times)
         new_signatures[i, -INTERVALS_PER_DAY:] = ts.to_numpy(dtype=np.float32)
-        new_lat[i] = pd.to_numeric(g["BADGE_LAT"].iloc[0], errors="coerce")
-        new_lon[i] = pd.to_numeric(g["BADGE_LONG"].iloc[0], errors="coerce")
+
+        first = g.iloc[0]
+        lat_val = pd.to_numeric(first["BADGE_LAT"], errors="coerce")
+        lon_val = pd.to_numeric(first["BADGE_LONG"], errors="coerce")
+        new_lat[i] = lat_val
+        new_lon[i] = lon_val
+        meta_rows.append(
+            {
+                "BADGE": badge_str,
+                "BADGE_LAT": lat_val,
+                "BADGE_LONG": lon_val,
+                "DEVICE_TYPE_CD": first["DEVICE_TYPE_CD"],
+                "NOMINAL": pd.to_numeric(first["NOMINAL"], errors="coerce"),
+            }
+        )
 
     new_signatures.flush()
     del new_signatures
     gc.collect()
 
     print("Updating metadata ...")
-    new_meta_rows = (
-        new_df.sort_values("MSRMTDTTM")
-        .groupby("BADGE", as_index=False)
-        .first()[["BADGE", "BADGE_LAT", "BADGE_LONG", "DEVICE_TYPE_CD", "NOMINAL"]]
-    )
-    new_meta_rows["BADGE_LAT"] = pd.to_numeric(
-        new_meta_rows["BADGE_LAT"], errors="coerce"
-    )
-    new_meta_rows["BADGE_LONG"] = pd.to_numeric(
-        new_meta_rows["BADGE_LONG"], errors="coerce"
-    )
+    new_meta_rows = pd.DataFrame(meta_rows)
     meta_updated = (
         pd.concat([old_meta, new_meta_rows], ignore_index=True)
         .sort_values("BADGE")
@@ -138,7 +147,7 @@ def main(new_day_parquet):
         .reset_index(drop=True)
     )
 
-    del new_df, old_meta, new_meta_rows
+    del new_df, old_meta, new_meta_rows, meta_rows
     gc.collect()
 
     # Atomic swap. Windows can't rename over an existing file, so unlink first.
