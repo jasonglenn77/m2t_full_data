@@ -56,14 +56,19 @@ def main(new_day_parquet):
             "NOMINAL",
         ],
     )
-    # Cast wide-string columns to category early — drops the BADGE column
-    # alone from ~1.6 GB (20M rows × ~80 bytes/object) to ~40 MB on a typical
-    # day, which makes groupby allocations fit easily.
-    new_df["BADGE"] = new_df["BADGE"].astype(str).astype("category")
+    # Cast directly to category WITHOUT a prior .astype(str). The previous
+    # approach materialized BADGE as 20M Python string objects (~1.6 GB) just
+    # to immediately throw it away during categoricalization, which also
+    # triggered pandas' complex128 type-inference allocation. Categories work
+    # fine on int values; we only stringify the ~218K unique category labels
+    # below, not the 20M-row column.
+    new_df["BADGE"] = new_df["BADGE"].astype("category")
     new_df["DEVICE_TYPE_CD"] = new_df["DEVICE_TYPE_CD"].astype("category")
     new_df["MSRMTDTTM"] = pd.to_datetime(new_df["MSRMTDTTM"], utc=True)
 
-    new_badges_set = set(new_df["BADGE"].cat.categories.astype(str))
+    new_badges_set = {
+        str(c) for c in new_df["BADGE"].cat.categories if pd.notna(c)
+    }
     added = sorted(new_badges_set - old_badges_set)
     removed = sorted(old_badges_set - new_badges_set)
     print(f"Added badges: {len(added)}")
