@@ -443,6 +443,7 @@ def main():
         ("transformer_corrections.csv", "transformer_corrections_enriched.csv"),
         ("corrections_ranked.csv", "corrections_ranked_enriched.csv"),
         ("corrections_with_stability.csv", "corrections_with_stability_enriched.csv"),
+        ("corrections_high_confidence.csv", "corrections_high_confidence_enriched.csv"),
     ]
     print("Enriching correction outputs:")
     for inp, outp in inputs:
