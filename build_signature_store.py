@@ -9,14 +9,13 @@ from config import DAILY_RAW_DIR, SIGNATURE_DIR, WINDOW_DAYS, INTERVALS_PER_DAY,
  
  
 def build_from_daily_files():
-    files = sorted(glob.glob(os.path.join(DAILY_RAW_DIR, "*.parquet")))
-    if not files:
-        raise ValueError("No daily parquet files found.")
- 
-    expected_files = WINDOW_DAYS
-    if len(files) != expected_files:
-        raise ValueError(f"Expected {expected_files} daily parquet files, found {len(files)}.")
- 
+    all_files = sorted(glob.glob(os.path.join(DAILY_RAW_DIR, "*.parquet")))
+    if len(all_files) < WINDOW_DAYS:
+        raise ValueError(f"Need at least {WINDOW_DAYS} daily files, found {len(all_files)}.")
+    files = all_files[-WINDOW_DAYS:]
+    print(f"Building signature store from latest {WINDOW_DAYS} days: "
+          f"{os.path.basename(files[0])} through {os.path.basename(files[-1])}")
+
     # -------- Pass 1: discover all badges and first-seen metadata --------
     all_badges = set()
     meta_rows = []

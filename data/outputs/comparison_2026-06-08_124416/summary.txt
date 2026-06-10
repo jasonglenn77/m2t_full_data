@@ -1,0 +1,32 @@
+============================================================
+M2T run comparison
+  baseline: data\outputs_baseline_2026-05-11
+  current:  data/outputs
+  generated: 2026-06-08_124416
+============================================================
+
+--- Badges ---
+  Baseline badges:       217871
+  Current  badges:       218135
+  Added (new only):         269
+  Dropped (gone):             5
+  Common to both runs:   217866
+
+--- Clusters ---
+  Baseline clusters:        56544
+  Current  clusters:        58686
+  Identical clusters:       40810
+  Old clusters that split:   6761
+  New clusters merged:       4793
+
+--- Membership churn (badges in common) ---
+  Badges with peer-set changes:    78794
+  Mean peer-set Jaccard (movers):  0.508
+
+--- transformer_corrections.csv diff ---
+               newly_flagged:  2051
+           no_longer_flagged:  3585
+      recommendation_changed:  1321
+                   unchanged:  8336
+
+Detail CSVs written to: data/outputs\comparison_2026-06-08_124416

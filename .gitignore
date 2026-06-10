@@ -7,4 +7,9 @@ data/raw/daily/*.parquet
 
 # Ignore large numpy file
 data/processed/signatures/signatures.npy
-5
+
+# Raw GIS source files (ServicePoints can exceed GitHub's 100 MB hard limit)
+GIS_mapping/*.csv
+
+# Memmap swap files left from interrupted rolling updates
+data/processed/signatures/signatures.npy.tmp
