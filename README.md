@@ -148,27 +148,212 @@ Created by `compare_runs.py`:
 
 ---
 
-## RECOMMENDATION_TYPE values
+## Run metrics — what they mean
 
-Each enriched correction carries one of four labels reflecting how to
-interpret it. Sort priority work by this column first.
+`evaluate_results.py` and `rank_corrections.py` print these values at
+the end of each run. They're the headline numbers worth quoting in
+summary emails and comparing across runs.
 
-| Value | Meaning | How to triage |
+### Cluster purity
+
+**What it measures:** Of all the clusters the model produced, what
+percentage contain meters from only one transformer (per GIS)?
+
+A cluster of size 5 where all 5 badges are GIS-mapped to transformer
+9027 is "pure." A cluster of size 5 with 3 on 9027 and 2 on 9073 is
+"impure."
+
+**Interpretation:** The *no false merges* metric. Higher is better. A
+typical run lands in the 91–94% range. The mutual top-K edge filter
+is naturally good at not joining meters with genuinely different
+signatures, so this number stays close to ceiling.
+
+### Transformer completeness
+
+**What it measures:** Of all the transformers known to GIS, what
+percentage have all their meters grouped into a single cluster?
+
+If transformer 9073 has 8 meters in GIS and all 8 are in cluster
+5861, that transformer is "complete." If 7 are in cluster 5861 and 1
+is in cluster 5850, it's "split."
+
+**Interpretation:** The *no false splits* metric. Higher is better,
+and this is the metric with the most room to improve. A meter
+physically connected to a transformer might fail to make the mutual
+top-K cut due to signature noise, sparse data, or geographic
+distance, causing the transformer to fragment across clusters.
+
+### How purity and completeness relate
+
+They're two sides of the same coin with an inverse tension:
+
+- **Tighten threshold** → purity ↑, completeness ↓ (cleaner clusters, more fragmentation)
+- **Loosen threshold** → purity ↓, completeness ↑ (bigger clusters, but more mixing)
+- **Ideal state** — both near 100%: every cluster is a single transformer, every transformer is a single cluster
+
+A run with purity 93% and completeness 44% says: when the model
+groups meters it's almost always right about them being on the same
+transformer (high purity), but it's missing many true connections
+(low completeness).
+
+### CONFIDENCE_GAP
+
+**Definition:** Per correction:
+
+```
+CONFIDENCE_GAP = (MAJORITY_VOTES − CURRENT_VOTES) / MAPPED_PEERS
+```
+
+The numerator is how many more peers vote for the recommendation
+than for the badge's current assignment. The denominator is the
+total mapped peers in the cluster.
+
+A gap of:
+
+- **0.0** — bare majority (1-vote difference in a small cluster)
+- **0.5** — strong majority lead (e.g., 5 vs 1 in a 6-peer cluster)
+- **1.0** — unanimous (every other peer says the same thing; no one agrees with current)
+
+**Median CONFIDENCE_GAP** is the middle value across all flagged
+corrections in a run. A median around 0.15 means: for the typical
+flagged badge, the cluster majority's lead over the current GIS
+assignment is small — only about 15% of the cluster's mapped-peer
+count. Half the corrections are at or below that level.
+
+**75th-percentile CONFIDENCE_GAP** is the value below which 75% of
+corrections fall. Only the top 25% have a stronger gap. The high
+end of this distribution is where the actually-actionable
+corrections live.
+
+### Strong-signal
+
+**Definition:** Corrections satisfying two single-run quality
+filters:
+
+1. `CONFIDENCE_GAP >= 0.5` — strong majority lead
+2. `MAPPED_PEERS >= 4` — at least 4 peers contributed to the vote
+
+**Interpretation:** A snapshot filter — only looks at this run's
+evidence, not history. Useful as a first cut, but a correction can
+be strong-signal in this run and never appear in any other run.
+That's why the next-stricter level (high-confidence) adds two
+cross-run stability gates.
+
+### High-confidence and the four gates
+
+**Definition:** Corrections passing *all four* gates simultaneously:
+
+| Gate | Threshold | What it checks |
 |---|---|---|
-| `cross_feeder_likely_gis_error` | Current and recommended transformers are on different feeders | **High signal.** Voltage signatures shouldn't cross feeders, so the parsimonious read is that GIS has the badge on the wrong feeder/transformer. |
-| `new_assignment` | Badge has no current transformer in GIS | **Easy win.** Push these to the GIS team as first-time assignment candidates. |
-| `same_feeder_ambiguous` | Both transformers on the same feeder | **Lower signal.** Same-feeder meters share upstream voltage; signatures can match across genuinely-different transformers. Combine with high stability AND field validation before acting. |
-| `unknown_feeder` | Feeder data missing for one or both transformers | Flag the underlying transformer to GIS to fill in feeder data; re-evaluate next run. |
+| 1. `CONFIDENCE_GAP >= 0.5` | ≥ 0.5 | Strong majority lead in this run's cluster vote |
+| 2. `MAPPED_PEERS >= 4` | ≥ 4 | Enough peers contributed to the vote |
+| 3. `PEER_STABILITY >= 0.7` | ≥ 0.7 | The badge's current peers have been peers in ≥70% of recorded runs (the cluster is stable across runs, not a one-off) |
+| 4. `RECOMMENDATION_STABILITY >= 0.7` | ≥ 0.7 | This same (badge → transformer) recommendation has been made in ≥70% of runs (the model is consistent across runs, not flailing) |
+
+Gates 1 and 2 are *single-run* evidence quality. Gates 3 and 4 are
+*cross-run* consistency.
+
+**Interpretation:** Passing all four means the model is making the
+same strong recommendation, backed by the same stable peer group, in
+run after run. That's as actionable as the model gets. The resulting
+`corrections_high_confidence_enriched.csv` is the file field
+operations should work from.
+
+---
+
+## RECOMMENDATION_TYPE — what each value means
+
+Each enriched correction carries one of four labels reflecting how
+to interpret the recommendation, based on the relationship between
+the current GIS feeder and the recommended transformer's feeder.
+Sort priority work by this column first.
+
+### cross_feeder_likely_gis_error
+
+**Definition:** The current transformer (per GIS) and the
+recommended transformer are on different feeders.
+
+**Interpretation:** **High signal — strongest "GIS is probably
+wrong" indicator.** Voltage signatures shouldn't correlate across
+feeders because they're served by different substations or different
+primary lines. If the model says they do correlate, the simplest
+explanation is that GIS has the badge on the wrong
+feeder/transformer.
+
+**Priority:** Top of the field-team's queue, especially when
+RECOMMENDATION_STABILITY is also high.
+
+### new_assignment
+
+**Definition:** The badge has no current transformer assigned in
+GIS (unmapped), and the model has clustered it with badges that do
+have an assignment.
+
+**Interpretation:** **Easy wins for the GIS team.** These aren't
+disputes — they're proposed first-time mappings for meters GIS
+doesn't have a transformer for. If MAJORITY_SHARE is 1.0 (every
+peer agrees), it's a slam-dunk recommendation.
+
+**Priority:** Push to the GIS team for first-time mapping,
+regardless of stability scores.
+
+### same_feeder_ambiguous
+
+**Definition:** The current transformer and the recommended
+transformer are on the same feeder.
+
+**Interpretation:** **Lower signal on its own.** Meters on the same
+feeder share upstream voltage from the substation, so their
+signatures can correlate strongly even on physically-different
+transformers — especially adjacent transformers in residential
+subdivisions. This is the category where the model genuinely
+struggles, and where field validation has confirmed false positives
+(see "About the model's confidence limits" below).
+
+**Priority:** Deprioritize. Even with high RECOMMENDATION_STABILITY,
+treat as candidates for field validation rather than recommended
+actions. Don't apply blind.
+
+### unknown_feeder
+
+**Definition:** Feeder data (FEEDERID) is missing in GIS for one
+or both of the transformers involved.
+
+**Interpretation:** **Can't classify — needs GIS data improvement
+first.** The model has produced a recommendation, but without
+feeder context we can't tell whether it's a cross-feeder case
+(high signal) or a same-feeder case (low signal).
+
+**Priority:** Send the underlying transformer(s) to the GIS team
+to populate FEEDERID. After the next ServicePoints/Transformers
+refresh these will reclassify and you'll know whether to act on
+them.
 
 ### About the model's confidence limits
 
-Voltage-signature correlation has a fundamental ceiling on what it can
-distinguish. Two transformers sharing an upstream feeder, especially
-adjacent ones in residential subdivisions, can produce voltage signatures
-that look identical to the model. Field validation has confirmed this in
-practice. The `same_feeder_ambiguous` label is the model's way of saying
-"I have a recommendation but I can't reliably verify it from voltage
+Voltage-signature correlation has a fundamental ceiling on what it
+can distinguish. Two transformers sharing an upstream feeder,
+especially adjacent ones in residential subdivisions, can produce
+voltage signatures that look identical to the model. Field
+validation has confirmed this in practice. The
+`same_feeder_ambiguous` label is the model's way of saying "I have
+a recommendation but I can't reliably verify it from voltage
 alone."
+
+### Triage priority in plain English
+
+If a field tech walks up and asks "which of these should I actually
+investigate?", the priority order is:
+
+1. **High-confidence + cross_feeder_likely_gis_error** — strongest
+   possible signal; GIS feeder data probably wrong.
+2. **High-confidence + new_assignment** — unmapped meters with
+   strong cluster vote; push to GIS team to add.
+3. **Strong-signal + cross_feeder_likely_gis_error not yet in the
+   high-confidence list** — single-run strong, doesn't have
+   multi-run history yet; investigate on a slower timeline.
+4. **Anything same_feeder_ambiguous** — last priority; treat as
+   field-validation candidates if at all.
 
 ---
 
