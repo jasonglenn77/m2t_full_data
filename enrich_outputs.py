@@ -208,6 +208,10 @@ def enrich_file(input_path, output_path, sp, tx_lookup, model_latlon):
     }
     sp_badge = sp[list(sp_badge_cols.keys())].rename(columns=sp_badge_cols)
     df = df.merge(sp_badge, on="BADGE", how="left")
+    # Mirror ServicePoints column names so downstream tools that expect
+    # POINT_X / POINT_Y have them verbatim.
+    df["BADGE_POINT_X"] = df["GIS_BADGE_LON"]
+    df["BADGE_POINT_Y"] = df["GIS_BADGE_LAT"]
 
     if model_latlon is not None:
         df = df.merge(model_latlon, on="BADGE", how="left")
@@ -365,6 +369,60 @@ def write_missing_from_gis(sp, tx_lookup):
     print(f"    Wrote {len(out):,} badges missing from GIS")
 
 
+def write_full_clusters_enriched(sp, model_latlon):
+    if not os.path.exists(CLUSTERS):
+        print(f"  Skipping full_clusters_enriched.csv: {CLUSTERS} not found")
+        return
+
+    print("  Building full_clusters_enriched.csv ...")
+    clusters = pd.read_csv(CLUSTERS, dtype=str)
+    clusters["BADGE"] = clusters["BADGE"].astype(str)
+
+    sp_cols = {
+        "BADGENUMBER": "BADGE",
+        "CCBADDRESS1": "BADGE_ADDRESS",
+        "CCBCITY": "BADGE_CITY",
+        "POINT_X": "BADGE_POINT_X",
+        "POINT_Y": "BADGE_POINT_Y",
+        "d_FEEDERID": "BADGE_FEEDERID",
+        "TRANSFORMERBANKOBJECTID": "GIS_TRANSFORMER",
+        "TRANSBANKTAG": "GIS_TRANSBANKTAG",
+    }
+    sp_subset = sp[list(sp_cols.keys())].rename(columns=sp_cols).copy()
+    sp_subset["GIS_TRANSFORMER"] = normalize_id(sp_subset["GIS_TRANSFORMER"])
+
+    out = clusters.merge(sp_subset, on="BADGE", how="left")
+
+    if model_latlon is not None:
+        out = out.merge(model_latlon, on="BADGE", how="left")
+
+    cluster_size = (
+        clusters.groupby("CLUSTER").size().rename("CLUSTER_SIZE").reset_index()
+    )
+    out = out.merge(cluster_size, on="CLUSTER", how="left")
+
+    cols = [
+        "BADGE",
+        "CLUSTER",
+        "CLUSTER_SIZE",
+        "GIS_TRANSFORMER",
+        "GIS_TRANSBANKTAG",
+        "BADGE_ADDRESS",
+        "BADGE_CITY",
+        "BADGE_POINT_X",
+        "BADGE_POINT_Y",
+        "BADGE_FEEDERID",
+        "MODEL_BADGE_LAT",
+        "MODEL_BADGE_LON",
+    ]
+    cols = [c for c in cols if c in out.columns]
+    out = out[cols]
+    out.to_csv(os.path.join(OUT_DIR, "full_clusters_enriched.csv"), index=False)
+    print(
+        f"    Wrote {len(out):,} rows (every badge with cluster + GIS context)"
+    )
+
+
 def write_latlon_discrepancies(sp, model_latlon):
     if model_latlon is None:
         print(
@@ -458,6 +516,7 @@ def main():
     print("Producing supplementary reports:")
     write_missing_from_gis(sp, tx_lookup)
     write_latlon_discrepancies(sp, model_latlon)
+    write_full_clusters_enriched(sp, model_latlon)
 
 
 if __name__ == "__main__":
