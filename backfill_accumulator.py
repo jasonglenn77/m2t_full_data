@@ -84,12 +84,19 @@ def main():
     if args.resume and os.path.exists(LEDGER_PATH):
         print(f"  Resuming from existing ledger at {LEDGER_PATH}")
         ledger_dict = ledger_to_dict(load_ledger())
-        # Filter out already-processed days so update_pair's idempotence
-        # short-circuits the work cleanly.
         already_done = {e["LAST_DAY"] for e in ledger_dict.values()}
         if already_done:
             most_recent = max(already_done)
             print(f"  Ledger's most recent day: {most_recent}")
+            before = len(files)
+            files = [f for f in files if day_label_from_path(f) > most_recent]
+            print(
+                f"  Skipping {before - len(files)} already-processed day(s); "
+                f"{len(files)} parquets remaining"
+            )
+            if not files:
+                print("Nothing to do; ledger is already up to date.")
+                return
     else:
         if os.path.exists(LEDGER_PATH):
             confirm = (

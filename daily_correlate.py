@@ -109,8 +109,16 @@ def compute_daily_correlations(badges, signatures, lats, lons):
     For each within-radius candidate pair, compute the daily Pearson.
     Returns a list of (badge_a, badge_b, r) tuples in canonical order.
 
-    Skips pairs where overlap < MIN_DAILY_OVERLAP or one signature is
-    constant (zero variance, NaN correlation).
+    Vectorized: for each badge i, computes Pearson with all of its upper-
+    triangle neighbors in one batched numpy operation. Much faster than
+    a per-pair np.corrcoef call.
+
+    Handles per-pair NaN masks correctly: positions where either signal
+    is NaN are excluded from that pair's correlation (each pair has its
+    own effective sample size).
+
+    Skips pairs where overlap < MIN_DAILY_OVERLAP or either signal is
+    constant within its mask (denominator zero, correlation undefined).
     """
     if len(badges) == 0:
         return []
@@ -119,30 +127,69 @@ def compute_daily_correlations(badges, signatures, lats, lons):
     neighbors = find_neighbors(tree, coords)
 
     pair_updates = []
-    finite_mask = np.isfinite(signatures)  # (n, 96) bool array, computed once
+    finite_mask = np.isfinite(signatures)  # (n_badges, 96) bool
+    # Replace NaN with 0 once; pair_mask gates which positions contribute,
+    # so the 0s are harmless for the Pearson math.
+    sig_clean = np.where(finite_mask, signatures, 0.0).astype(np.float64)
 
     for i in range(len(badges)):
-        sig_i = signatures[i]
-        finite_i = finite_mask[i]
-        badge_i = badges[i]
-        for j in neighbors[i]:
-            if j <= i:
-                continue
-            sig_j = signatures[j]
-            mask = finite_i & finite_mask[j]
-            overlap = int(mask.sum())
-            if overlap < MIN_DAILY_OVERLAP:
-                continue
-            a = sig_i[mask]
-            b = sig_j[mask]
-            # Skip degenerate constant signals (no variance => undefined Pearson)
-            if a.std() == 0 or b.std() == 0:
-                continue
-            r = float(np.corrcoef(a, b)[0, 1])
-            if not np.isfinite(r):
-                continue
-            a_id, b_id = canonical_pair(badge_i, badges[j])
-            pair_updates.append((a_id, b_id, r))
+        all_js = neighbors[i]
+        # Upper-triangle: skip self and already-processed pairs
+        js = all_js[all_js > i]
+        if len(js) == 0:
+            continue
+
+        sig_i = sig_clean[i]              # (96,)
+        finite_i = finite_mask[i]         # (96,) bool
+        sig_js = sig_clean[js]            # (n_j, 96)
+        valid_js = finite_mask[js]        # (n_j, 96) bool
+
+        pair_mask = finite_i[None, :] & valid_js  # (n_j, 96) bool
+        n_per_pair = pair_mask.sum(axis=1)        # (n_j,)
+        keep = n_per_pair >= MIN_DAILY_OVERLAP
+        if not keep.any():
+            continue
+
+        js = js[keep]
+        sig_js = sig_js[keep]
+        pair_mask = pair_mask[keep]
+        n_per_pair = n_per_pair[keep].astype(np.float64)
+
+        # Per-pair means over each pair's own mask
+        sum_i = (sig_i[None, :] * pair_mask).sum(axis=1)
+        sum_j = (sig_js * pair_mask).sum(axis=1)
+        mean_i = sum_i / n_per_pair
+        mean_j = sum_j / n_per_pair
+
+        # Centered values within the mask, zero outside
+        centered_i = np.where(pair_mask, sig_i[None, :] - mean_i[:, None], 0.0)
+        centered_j = np.where(pair_mask, sig_js - mean_j[:, None], 0.0)
+
+        numerator = (centered_i * centered_j).sum(axis=1)
+        norm_i_sq = (centered_i ** 2).sum(axis=1)
+        norm_j_sq = (centered_j ** 2).sum(axis=1)
+        denominator_sq = norm_i_sq * norm_j_sq
+
+        valid_r = denominator_sq > 0
+        if not valid_r.any():
+            continue
+
+        # Use a safe denominator for the division to avoid runtime warnings;
+        # we mask out the invalid entries immediately after.
+        rs = numerator / np.sqrt(np.where(valid_r, denominator_sq, 1.0))
+        finite_r = valid_r & np.isfinite(rs)
+        if not finite_r.any():
+            continue
+
+        badge_i_id = badges[i]
+        for k in np.where(finite_r)[0]:
+            j_idx = int(js[k])
+            badge_j_id = badges[j_idx]
+            r = float(rs[k])
+            if badge_i_id < badge_j_id:
+                pair_updates.append((badge_i_id, badge_j_id, r))
+            else:
+                pair_updates.append((badge_j_id, badge_i_id, r))
 
     return pair_updates
 
