@@ -57,6 +57,14 @@ SIG_BADGE_IDS = os.path.join(SIG_DIR, "badge_ids.npy")
 SIG_LAT = os.path.join(SIG_DIR, "lat.npy")
 SIG_LON = os.path.join(SIG_DIR, "lon.npy")
 
+DAILY_RAW_DIR = "data/raw/daily"
+# Number of most-recent daily parquets used to define "currently active"
+# badges. badges_missing_from_gis.csv is filtered to badges that appeared
+# in at least one of these days so stale meters (e.g., decommissioned
+# weeks ago but still in the signature store's badge list) don't pollute
+# the report. A 7-day window tolerates occasional missed reads.
+RECENT_DAYS = 7
+
 CLUSTERS = os.path.join(OUT_DIR, "full_clusters.csv")
 KNOWN_MAPPING = os.path.join(OUT_DIR, "known_mapping.csv")
 
@@ -287,6 +295,28 @@ def enrich_file(input_path, output_path, sp, tx_lookup, model_latlon):
         print(f"      {k}: {v:,}")
 
 
+def get_recently_active_badges(n_days=RECENT_DAYS):
+    """
+    Return the union of badges that appeared in the latest n_days daily
+    parquets. Used as a "currently active" filter so the missing-from-GIS
+    report excludes meters that stopped reporting weeks ago but are still
+    carried in the signature store's badge list.
+
+    Returns None if data/raw/daily/ is not present (e.g., running on a
+    machine without raw data); caller should fall back to no filter.
+    """
+    if not os.path.isdir(DAILY_RAW_DIR):
+        return None
+    files = sorted(glob.glob(os.path.join(DAILY_RAW_DIR, "*.parquet")))[-n_days:]
+    if not files:
+        return None
+    active = set()
+    for f in files:
+        df = pd.read_parquet(f, columns=["BADGE"])
+        active.update(df["BADGE"].astype(str).unique())
+    return active
+
+
 def write_missing_from_gis(sp, tx_lookup):
     if not os.path.exists(CLUSTERS):
         print(f"  Skipping missing-from-GIS report: {CLUSTERS} not found")
@@ -298,6 +328,25 @@ def write_missing_from_gis(sp, tx_lookup):
     sp_badges = set(sp["BADGENUMBER"])
 
     missing = clusters[~clusters["BADGE"].isin(sp_badges)].copy()
+
+    # Filter to badges that have appeared in the most recent daily parquets
+    # so this report reflects currently-active meters rather than stale
+    # entries left in the signature store's badge list. Falls back to no
+    # filter if raw daily parquets aren't on this machine.
+    active = get_recently_active_badges()
+    if active is not None:
+        before = len(missing)
+        missing = missing[missing["BADGE"].isin(active)].copy()
+        print(
+            f"    Recency filter: {len(missing):,} of {before:,} badges "
+            f"appeared in the last {RECENT_DAYS} daily parquets"
+        )
+    else:
+        print(
+            f"    NOTE: {DAILY_RAW_DIR} not found — skipping recency filter; "
+            f"output may include stale badges no longer reporting."
+        )
+
     if missing.empty:
         print("    No badges in clusters are missing from GIS.")
         empty = pd.DataFrame(
