@@ -5,11 +5,13 @@ Persistent ledger of daily Pearson correlations per badge pair (v2 model).
 For each candidate pair (sorted so BADGE_A < BADGE_B) we keep up to
 WINDOW_DAYS most recent daily Pearson values, plus historical metadata.
 Daily values older than WINDOW_DAYS days drop off — this is the
-structural protection against stickiness (an early-formed edge can't
-persist forever if recent daily correlations don't keep clearing the
-gates).
+structural protection against stickiness.
 
-Storage: data/state/pair_ledger.parquet
+In-memory storage: PairLedger class with parallel numpy arrays + a
+(BADGE_A, BADGE_B) -> row_index lookup dict. For 11.7M pairs this uses
+~7 GB instead of ~15 GB for the previous dict-of-dicts representation.
+
+On-disk storage: data/state/pair_ledger.parquet
     BADGE_A (str)         -- always BADGE_A < BADGE_B
     BADGE_B (str)
     VALUES (list[float])  -- daily Pearson values, oldest first, len <= WINDOW_DAYS
@@ -18,15 +20,14 @@ Storage: data/state/pair_ledger.parquet
     FIRST_DAY (str)       -- 'YYYY-MM-DD' of first observation
     LAST_DAY (str)        -- 'YYYY-MM-DD' of most recent observation
 
-Operations are intentionally simple for the Phase 1 prototype: load full
-ledger -> dict, mutate in place, dump dict back to DataFrame, write. This
-will work fine for a few million pairs; optimize if/when needed.
+Schema is unchanged from earlier versions, so existing on-disk ledgers
+load correctly into the new PairLedger.
 """
 
+import gc
 import os
 
 import numpy as np
-import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 
@@ -35,18 +36,6 @@ from config import WINDOW_DAYS
 LEDGER_DIR = "data/state"
 LEDGER_PATH = os.path.join(LEDGER_DIR, "pair_ledger.parquet")
 
-LEDGER_COLUMNS = [
-    "BADGE_A",
-    "BADGE_B",
-    "VALUES",
-    "HISTORICAL_N",
-    "HISTORICAL_MEAN",
-    "FIRST_DAY",
-    "LAST_DAY",
-]
-
-# pyarrow schema matching LEDGER_COLUMNS exactly. Used for streaming saves
-# that bypass pandas DataFrame materialization (which doubles peak RAM).
 LEDGER_SCHEMA = pa.schema(
     [
         ("BADGE_A", pa.string()),
@@ -59,9 +48,8 @@ LEDGER_SCHEMA = pa.schema(
     ]
 )
 
-# Per-batch write size for save_ledger_from_dict. 500K pairs per chunk keeps
-# peak chunk memory in the low hundreds of MB.
 SAVE_CHUNK_SIZE = 500_000
+LOAD_CHUNK_SIZE = 500_000
 
 
 def canonical_pair(a, b):
@@ -69,177 +57,252 @@ def canonical_pair(a, b):
     return (a, b) if a < b else (b, a)
 
 
-def load_ledger():
-    """Read the ledger from disk. Returns empty DataFrame with correct columns if absent."""
-    if not os.path.exists(LEDGER_PATH):
-        return pd.DataFrame(columns=LEDGER_COLUMNS)
-    return pd.read_parquet(LEDGER_PATH)
-
-
-def save_ledger(df):
-    """Write a DataFrame ledger to disk atomically (write to .tmp then rename).
-
-    Prefer save_ledger_from_dict() in the backfill / daily-update hot path —
-    that streams from the working dict directly to Parquet in chunks and
-    avoids materializing a multi-GB DataFrame in memory just to save it.
+class PairLedger:
     """
-    os.makedirs(LEDGER_DIR, exist_ok=True)
-    tmp = LEDGER_PATH + ".tmp"
-    df.to_parquet(tmp, index=False)
-    if os.path.exists(LEDGER_PATH):
-        os.remove(LEDGER_PATH)
-    os.rename(tmp, LEDGER_PATH)
+    In-memory ledger of pair correlations using parallel numpy arrays.
 
+    Storage layout (capacity-sized arrays, only first n entries are valid):
+        badge_a:         object array of badge IDs (string-like)
+        badge_b:         object array of badge IDs (string-like)
+        daily_values:    (capacity, WINDOW_DAYS) float32, NaN-filled
+        n_recent:        int16 — how many leading slots of daily_values are populated
+        historical_n:    int32 — total count ever observed (may exceed WINDOW_DAYS)
+        historical_mean: float64 — running mean over all-time observations
+        first_day:       object array of 'YYYY-MM-DD' strings
+        last_day:        object array of 'YYYY-MM-DD' strings
 
-def save_ledger_from_dict(d):
+    index: dict {(BADGE_A, BADGE_B): row_index} for fast pair lookup.
     """
-    Stream the in-memory ledger dict directly to Parquet in chunks of
-    SAVE_CHUNK_SIZE pairs each. Avoids the memory spike that occurs when
-    converting dict -> list-of-dicts -> DataFrame -> Parquet (each step
-    roughly doubles RAM).
 
-    Produces a Parquet file with the same LEDGER_SCHEMA as save_ledger(),
-    so loaders don't need to care which path was used to write it.
+    INITIAL_CAPACITY = 13_000_000
 
-    Atomically replaces LEDGER_PATH via a .tmp file.
-    """
-    os.makedirs(LEDGER_DIR, exist_ok=True)
-    tmp = LEDGER_PATH + ".tmp"
+    def __init__(self, capacity=None):
+        self.n = 0
+        self.capacity = 0
+        self.index = {}
+        self.badge_a = None
+        self.badge_b = None
+        self.daily_values = None
+        self.n_recent = None
+        self.historical_n = None
+        self.historical_mean = None
+        self.first_day = None
+        self.last_day = None
+        self._grow(capacity or self.INITIAL_CAPACITY)
 
-    if not d:
-        # Empty ledger: still write a valid Parquet file with the schema.
-        empty = {col.name: [] for col in LEDGER_SCHEMA}
-        with pq.ParquetWriter(tmp, LEDGER_SCHEMA) as writer:
-            writer.write_batch(pa.RecordBatch.from_pydict(empty, schema=LEDGER_SCHEMA))
-    else:
-        chunk = {
-            "BADGE_A": [],
-            "BADGE_B": [],
-            "VALUES": [],
-            "HISTORICAL_N": [],
-            "HISTORICAL_MEAN": [],
-            "FIRST_DAY": [],
-            "LAST_DAY": [],
-        }
-        with pq.ParquetWriter(tmp, LEDGER_SCHEMA) as writer:
-            for (a, b), e in d.items():
-                chunk["BADGE_A"].append(a)
-                chunk["BADGE_B"].append(b)
-                chunk["VALUES"].append(e["VALUES"])
-                chunk["HISTORICAL_N"].append(e["HISTORICAL_N"])
-                chunk["HISTORICAL_MEAN"].append(e["HISTORICAL_MEAN"])
-                chunk["FIRST_DAY"].append(e["FIRST_DAY"])
-                chunk["LAST_DAY"].append(e["LAST_DAY"])
+    def __len__(self):
+        return self.n
 
-                if len(chunk["BADGE_A"]) >= SAVE_CHUNK_SIZE:
+    def _grow(self, target_capacity):
+        """Allocate or expand arrays to target_capacity, copying existing data."""
+        if target_capacity <= self.capacity:
+            return
+
+        new_badge_a = np.empty(target_capacity, dtype=object)
+        new_badge_b = np.empty(target_capacity, dtype=object)
+        new_daily_values = np.full(
+            (target_capacity, WINDOW_DAYS), np.nan, dtype=np.float32
+        )
+        new_n_recent = np.zeros(target_capacity, dtype=np.int16)
+        new_historical_n = np.zeros(target_capacity, dtype=np.int32)
+        new_historical_mean = np.zeros(target_capacity, dtype=np.float64)
+        new_first_day = np.empty(target_capacity, dtype=object)
+        new_last_day = np.empty(target_capacity, dtype=object)
+
+        if self.n > 0:
+            new_badge_a[: self.n] = self.badge_a[: self.n]
+            new_badge_b[: self.n] = self.badge_b[: self.n]
+            new_daily_values[: self.n] = self.daily_values[: self.n]
+            new_n_recent[: self.n] = self.n_recent[: self.n]
+            new_historical_n[: self.n] = self.historical_n[: self.n]
+            new_historical_mean[: self.n] = self.historical_mean[: self.n]
+            new_first_day[: self.n] = self.first_day[: self.n]
+            new_last_day[: self.n] = self.last_day[: self.n]
+
+            # Free old arrays before retaining the new ones to avoid peak-RAM doubling
+            self.badge_a = None
+            self.badge_b = None
+            self.daily_values = None
+            self.n_recent = None
+            self.historical_n = None
+            self.historical_mean = None
+            self.first_day = None
+            self.last_day = None
+            gc.collect()
+
+        self.badge_a = new_badge_a
+        self.badge_b = new_badge_b
+        self.daily_values = new_daily_values
+        self.n_recent = new_n_recent
+        self.historical_n = new_historical_n
+        self.historical_mean = new_historical_mean
+        self.first_day = new_first_day
+        self.last_day = new_last_day
+        self.capacity = target_capacity
+
+    def update(self, badge_a, badge_b, r, day):
+        """
+        Apply one pair's correlation for a given day.
+
+        Idempotent for re-runs of the same day: if LAST_DAY >= day, skip.
+
+        For new pairs: append a fresh entry.
+        For existing pairs: append r to the rolling window, trim to
+        WINDOW_DAYS most recent values, update historical running stats.
+        """
+        if badge_b < badge_a:
+            badge_a, badge_b = badge_b, badge_a
+        key = (badge_a, badge_b)
+        idx = self.index.get(key)
+
+        if idx is None:
+            if self.n >= self.capacity:
+                self._grow(max(self.capacity + 1, int(self.capacity * 1.5)))
+            idx = self.n
+            self.index[key] = idx
+            self.n += 1
+            self.badge_a[idx] = badge_a
+            self.badge_b[idx] = badge_b
+            self.daily_values[idx, 0] = r
+            self.n_recent[idx] = 1
+            self.historical_n[idx] = 1
+            self.historical_mean[idx] = float(r)
+            self.first_day[idx] = day
+            self.last_day[idx] = day
+            return
+
+        if self.last_day[idx] >= day:
+            return
+
+        cur_n = int(self.n_recent[idx])
+        if cur_n < WINDOW_DAYS:
+            self.daily_values[idx, cur_n] = r
+            self.n_recent[idx] = cur_n + 1
+        else:
+            # Shift the rolling window left, drop oldest, append newest
+            self.daily_values[idx, :-1] = self.daily_values[idx, 1:]
+            self.daily_values[idx, -1] = r
+
+        self.historical_n[idx] += 1
+        n_hist = int(self.historical_n[idx])
+        self.historical_mean[idx] += (
+            float(r) - self.historical_mean[idx]
+        ) / n_hist
+        self.last_day[idx] = day
+
+    def most_recent_day(self):
+        """Return the maximum LAST_DAY across all pairs, or None if empty."""
+        if self.n == 0:
+            return None
+        return max(self.last_day[: self.n])
+
+    def save(self):
+        """
+        Stream to Parquet in SAVE_CHUNK_SIZE-row batches. Atomically replaces
+        LEDGER_PATH via a .tmp file.
+        """
+        os.makedirs(LEDGER_DIR, exist_ok=True)
+        tmp = LEDGER_PATH + ".tmp"
+
+        if self.n == 0:
+            empty = {col.name: [] for col in LEDGER_SCHEMA}
+            with pq.ParquetWriter(tmp, LEDGER_SCHEMA) as writer:
+                writer.write_batch(
+                    pa.RecordBatch.from_pydict(empty, schema=LEDGER_SCHEMA)
+                )
+        else:
+            with pq.ParquetWriter(tmp, LEDGER_SCHEMA) as writer:
+                for start in range(0, self.n, SAVE_CHUNK_SIZE):
+                    end = min(start + SAVE_CHUNK_SIZE, self.n)
+
+                    # Build per-row variable-length VALUES lists for this chunk.
+                    # daily_values is fixed-width (capacity, WINDOW_DAYS); we
+                    # serialize only the populated leading slots per row.
+                    values_lists = []
+                    for i in range(start, end):
+                        cur_n = int(self.n_recent[i])
+                        values_lists.append(
+                            self.daily_values[i, :cur_n].astype(np.float64).tolist()
+                        )
+
+                    chunk = {
+                        "BADGE_A": self.badge_a[start:end].tolist(),
+                        "BADGE_B": self.badge_b[start:end].tolist(),
+                        "VALUES": values_lists,
+                        "HISTORICAL_N": self.historical_n[start:end].tolist(),
+                        "HISTORICAL_MEAN": self.historical_mean[start:end].tolist(),
+                        "FIRST_DAY": self.first_day[start:end].tolist(),
+                        "LAST_DAY": self.last_day[start:end].tolist(),
+                    }
                     writer.write_batch(
                         pa.RecordBatch.from_pydict(chunk, schema=LEDGER_SCHEMA)
                     )
-                    for key in chunk:
-                        chunk[key].clear()
 
-            if chunk["BADGE_A"]:
-                writer.write_batch(
-                    pa.RecordBatch.from_pydict(chunk, schema=LEDGER_SCHEMA)
-                )
+        if os.path.exists(LEDGER_PATH):
+            os.remove(LEDGER_PATH)
+        os.rename(tmp, LEDGER_PATH)
 
-    if os.path.exists(LEDGER_PATH):
-        os.remove(LEDGER_PATH)
-    os.rename(tmp, LEDGER_PATH)
+    @classmethod
+    def load(cls):
+        """
+        Stream-load from LEDGER_PATH, populating the in-memory arrays
+        without ever materializing the full ledger as a pandas DataFrame.
 
+        Returns an empty PairLedger if no file exists yet.
+        """
+        if not os.path.exists(LEDGER_PATH):
+            return cls()
 
-def ledger_to_dict(df):
-    """
-    Convert ledger DataFrame to dict keyed by (BADGE_A, BADGE_B).
+        parquet_file = pq.ParquetFile(LEDGER_PATH)
+        n_total = parquet_file.metadata.num_rows
+        ledger = cls(capacity=max(cls.INITIAL_CAPACITY, int(n_total * 1.2) + 1))
 
-    Each value is {"VALUES": list[float], "HISTORICAL_N": int,
-    "HISTORICAL_MEAN": float, "FIRST_DAY": str, "LAST_DAY": str}.
-    """
-    if df.empty:
-        return {}
-    out = {}
-    for a, b, vals, hn, hm, fd, ld in zip(
-        df["BADGE_A"],
-        df["BADGE_B"],
-        df["VALUES"],
-        df["HISTORICAL_N"],
-        df["HISTORICAL_MEAN"],
-        df["FIRST_DAY"],
-        df["LAST_DAY"],
-    ):
-        out[(a, b)] = {
-            "VALUES": list(vals),
-            "HISTORICAL_N": int(hn),
-            "HISTORICAL_MEAN": float(hm),
-            "FIRST_DAY": fd,
-            "LAST_DAY": ld,
-        }
-    return out
+        offset = 0
+        for batch in parquet_file.iter_batches(batch_size=LOAD_CHUNK_SIZE):
+            n_batch = batch.num_rows
+            end = offset + n_batch
 
+            badge_a_arr = batch.column("BADGE_A").to_pylist()
+            badge_b_arr = batch.column("BADGE_B").to_pylist()
+            values_arr = batch.column("VALUES").to_pylist()
+            historical_n_arr = batch.column("HISTORICAL_N").to_numpy()
+            historical_mean_arr = batch.column("HISTORICAL_MEAN").to_numpy()
+            first_day_arr = batch.column("FIRST_DAY").to_pylist()
+            last_day_arr = batch.column("LAST_DAY").to_pylist()
 
-def dict_to_ledger(d):
-    """Convert dict back to ledger DataFrame in stable column order."""
-    if not d:
-        return pd.DataFrame(columns=LEDGER_COLUMNS)
-    rows = []
-    for (a, b), e in d.items():
-        rows.append(
-            {
-                "BADGE_A": a,
-                "BADGE_B": b,
-                "VALUES": e["VALUES"],
-                "HISTORICAL_N": e["HISTORICAL_N"],
-                "HISTORICAL_MEAN": e["HISTORICAL_MEAN"],
-                "FIRST_DAY": e["FIRST_DAY"],
-                "LAST_DAY": e["LAST_DAY"],
-            }
-        )
-    return pd.DataFrame(rows, columns=LEDGER_COLUMNS)
+            ledger.badge_a[offset:end] = badge_a_arr
+            ledger.badge_b[offset:end] = badge_b_arr
 
+            for i, (a, b) in enumerate(zip(badge_a_arr, badge_b_arr)):
+                ledger.index[(a, b)] = offset + i
 
-def update_pair(ledger_dict, badge_a, badge_b, r, day):
-    """
-    Update one pair's record. Mutates ledger_dict in place.
+            for i, vals in enumerate(values_arr):
+                cur_n = len(vals)
+                if cur_n > 0:
+                    ledger.daily_values[offset + i, :cur_n] = vals
+                    ledger.n_recent[offset + i] = cur_n
 
-    Idempotent for re-runs of the same day: if LAST_DAY >= day, skip
-    (the dict already has this day or a newer one).
+            ledger.historical_n[offset:end] = historical_n_arr.astype(np.int32)
+            ledger.historical_mean[offset:end] = historical_mean_arr.astype(
+                np.float64
+            )
+            ledger.first_day[offset:end] = first_day_arr
+            ledger.last_day[offset:end] = last_day_arr
 
-    For new pairs: create an entry with a single-element VALUES list.
-    For existing pairs: append r, trim to WINDOW_DAYS most recent values,
-    update historical running stats.
-    """
-    a, b = canonical_pair(badge_a, badge_b)
-    key = (a, b)
-    entry = ledger_dict.get(key)
+            offset = end
 
-    if entry is None:
-        ledger_dict[key] = {
-            "VALUES": [float(r)],
-            "HISTORICAL_N": 1,
-            "HISTORICAL_MEAN": float(r),
-            "FIRST_DAY": day,
-            "LAST_DAY": day,
-        }
-        return
+            del badge_a_arr, badge_b_arr, values_arr
+            del historical_n_arr, historical_mean_arr
+            del first_day_arr, last_day_arr
+            gc.collect()
 
-    if entry["LAST_DAY"] >= day:
-        return  # already have this day or newer; skip silently
-
-    values = entry["VALUES"]
-    values.append(float(r))
-    if len(values) > WINDOW_DAYS:
-        values = values[-WINDOW_DAYS:]
-    entry["VALUES"] = values
-
-    entry["HISTORICAL_N"] += 1
-    n = entry["HISTORICAL_N"]
-    entry["HISTORICAL_MEAN"] += (float(r) - entry["HISTORICAL_MEAN"]) / n
-    entry["LAST_DAY"] = day
+        ledger.n = offset
+        return ledger
 
 
 def compute_stats(values):
     """
-    Given a list of daily correlation values (length <= WINDOW_DAYS),
+    Given an iterable of daily correlation values (length <= WINDOW_DAYS),
     return mean / std / trend / n.
 
     trend = mean of last third minus mean of first third, used as a

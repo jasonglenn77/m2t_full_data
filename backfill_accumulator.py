@@ -24,17 +24,12 @@ import sys
 
 from config import DAILY_RAW_DIR, WINDOW_DAYS
 from daily_correlate import (
-    apply_updates_to_dict,
+    apply_updates_to_ledger,
     compute_daily_correlations,
     day_label_from_path,
     read_day_signatures,
 )
-from pair_accumulator import (
-    LEDGER_PATH,
-    ledger_to_dict,
-    load_ledger,
-    save_ledger_from_dict,
-)
+from pair_accumulator import LEDGER_PATH, PairLedger
 
 
 def main():
@@ -82,10 +77,9 @@ def main():
 
     if args.resume and os.path.exists(LEDGER_PATH):
         print(f"  Resuming from existing ledger at {LEDGER_PATH}")
-        ledger_dict = ledger_to_dict(load_ledger())
-        already_done = {e["LAST_DAY"] for e in ledger_dict.values()}
-        if already_done:
-            most_recent = max(already_done)
+        ledger = PairLedger.load()
+        most_recent = ledger.most_recent_day()
+        if most_recent:
             print(f"  Ledger's most recent day: {most_recent}")
             before = len(files)
             files = [f for f in files if day_label_from_path(f) > most_recent]
@@ -96,6 +90,7 @@ def main():
             if not files:
                 print("Nothing to do; ledger is already up to date.")
                 return
+        print(f"  Loaded {len(ledger):,} pairs into in-memory ledger")
     else:
         if os.path.exists(LEDGER_PATH):
             confirm = (
@@ -109,7 +104,7 @@ def main():
             if confirm != "yes":
                 print("Aborted.")
                 return
-        ledger_dict = {}
+        ledger = PairLedger()
 
     print()
 
@@ -123,18 +118,18 @@ def main():
         pair_updates = compute_daily_correlations(badges, signatures, lats, lons)
         print(f"  {len(pair_updates):,} pair correlations")
 
-        apply_updates_to_dict(ledger_dict, pair_updates, day)
-        print(f"  Ledger now {len(ledger_dict):,} unique pairs")
+        apply_updates_to_ledger(ledger, pair_updates, day)
+        print(f"  Ledger now {len(ledger):,} unique pairs")
 
         del badges, signatures, lats, lons, pair_updates
         gc.collect()
 
         if i % args.save_every == 0 or i == len(files):
             print(f"  Saving ledger ...")
-            save_ledger_from_dict(ledger_dict)
+            ledger.save()
 
     print()
-    print(f"Backfill complete. Final ledger: {len(ledger_dict):,} unique pairs.")
+    print(f"Backfill complete. Final ledger: {len(ledger):,} unique pairs.")
     print(f"Saved to: {LEDGER_PATH}")
 
 

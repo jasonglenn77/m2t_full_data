@@ -25,13 +25,7 @@ import numpy as np
 import pandas as pd
 
 from config import INTERVALS_PER_DAY
-from pair_accumulator import (
-    canonical_pair,
-    ledger_to_dict,
-    load_ledger,
-    save_ledger_from_dict,
-    update_pair,
-)
+from pair_accumulator import PairLedger, canonical_pair
 from spatial_neighbors import build_tree, find_neighbors
 
 # Minimum non-NaN overlapping samples needed to compute a daily Pearson.
@@ -193,10 +187,10 @@ def compute_daily_correlations(badges, signatures, lats, lons):
     return pair_updates
 
 
-def apply_updates_to_dict(ledger_dict, pair_updates, day_label):
-    """Mutate ledger_dict in place by applying today's pair correlations."""
+def apply_updates_to_ledger(ledger, pair_updates, day_label):
+    """Apply today's pair correlations to the in-memory PairLedger."""
     for badge_a, badge_b, r in pair_updates:
-        update_pair(ledger_dict, badge_a, badge_b, r, day_label)
+        ledger.update(badge_a, badge_b, r, day_label)
 
 
 def main(parquet_path):
@@ -210,15 +204,12 @@ def main(parquet_path):
     print(f"  {len(pair_updates):,} pair correlations computed")
 
     print("  Loading ledger ...")
-    ledger_df = load_ledger()
-    ledger_dict = ledger_to_dict(ledger_df)
-    del ledger_df
-    gc.collect()
+    ledger = PairLedger.load()
 
-    apply_updates_to_dict(ledger_dict, pair_updates, day_label)
+    apply_updates_to_ledger(ledger, pair_updates, day_label)
 
-    print(f"  Writing ledger ({len(ledger_dict):,} unique pairs) ...")
-    save_ledger_from_dict(ledger_dict)
+    print(f"  Writing ledger ({len(ledger):,} unique pairs) ...")
+    ledger.save()
     print("Done.")
 
 
