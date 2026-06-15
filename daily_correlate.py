@@ -27,10 +27,9 @@ import pandas as pd
 from config import INTERVALS_PER_DAY
 from pair_accumulator import (
     canonical_pair,
-    dict_to_ledger,
     ledger_to_dict,
     load_ledger,
-    save_ledger,
+    save_ledger_from_dict,
     update_pair,
 )
 from spatial_neighbors import build_tree, find_neighbors
@@ -219,7 +218,7 @@ def main(parquet_path):
     apply_updates_to_dict(ledger_dict, pair_updates, day_label)
 
     print(f"  Writing ledger ({len(ledger_dict):,} unique pairs) ...")
-    save_ledger(dict_to_ledger(ledger_dict))
+    save_ledger_from_dict(ledger_dict)
     print("Done.")
 
 

@@ -31,10 +31,9 @@ from daily_correlate import (
 )
 from pair_accumulator import (
     LEDGER_PATH,
-    dict_to_ledger,
     ledger_to_dict,
     load_ledger,
-    save_ledger,
+    save_ledger_from_dict,
 )
 
 
@@ -132,7 +131,7 @@ def main():
 
         if i % args.save_every == 0 or i == len(files):
             print(f"  Saving ledger ...")
-            save_ledger(dict_to_ledger(ledger_dict))
+            save_ledger_from_dict(ledger_dict)
 
     print()
     print(f"Backfill complete. Final ledger: {len(ledger_dict):,} unique pairs.")

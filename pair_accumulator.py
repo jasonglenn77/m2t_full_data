@@ -27,6 +27,8 @@ import os
 
 import numpy as np
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 from config import WINDOW_DAYS
 
@@ -43,6 +45,24 @@ LEDGER_COLUMNS = [
     "LAST_DAY",
 ]
 
+# pyarrow schema matching LEDGER_COLUMNS exactly. Used for streaming saves
+# that bypass pandas DataFrame materialization (which doubles peak RAM).
+LEDGER_SCHEMA = pa.schema(
+    [
+        ("BADGE_A", pa.string()),
+        ("BADGE_B", pa.string()),
+        ("VALUES", pa.list_(pa.float64())),
+        ("HISTORICAL_N", pa.int32()),
+        ("HISTORICAL_MEAN", pa.float64()),
+        ("FIRST_DAY", pa.string()),
+        ("LAST_DAY", pa.string()),
+    ]
+)
+
+# Per-batch write size for save_ledger_from_dict. 500K pairs per chunk keeps
+# peak chunk memory in the low hundreds of MB.
+SAVE_CHUNK_SIZE = 500_000
+
 
 def canonical_pair(a, b):
     """Sort a pair so BADGE_A < BADGE_B (string comparison)."""
@@ -57,10 +77,72 @@ def load_ledger():
 
 
 def save_ledger(df):
-    """Write the ledger to disk atomically (write to .tmp then rename)."""
+    """Write a DataFrame ledger to disk atomically (write to .tmp then rename).
+
+    Prefer save_ledger_from_dict() in the backfill / daily-update hot path —
+    that streams from the working dict directly to Parquet in chunks and
+    avoids materializing a multi-GB DataFrame in memory just to save it.
+    """
     os.makedirs(LEDGER_DIR, exist_ok=True)
     tmp = LEDGER_PATH + ".tmp"
     df.to_parquet(tmp, index=False)
+    if os.path.exists(LEDGER_PATH):
+        os.remove(LEDGER_PATH)
+    os.rename(tmp, LEDGER_PATH)
+
+
+def save_ledger_from_dict(d):
+    """
+    Stream the in-memory ledger dict directly to Parquet in chunks of
+    SAVE_CHUNK_SIZE pairs each. Avoids the memory spike that occurs when
+    converting dict -> list-of-dicts -> DataFrame -> Parquet (each step
+    roughly doubles RAM).
+
+    Produces a Parquet file with the same LEDGER_SCHEMA as save_ledger(),
+    so loaders don't need to care which path was used to write it.
+
+    Atomically replaces LEDGER_PATH via a .tmp file.
+    """
+    os.makedirs(LEDGER_DIR, exist_ok=True)
+    tmp = LEDGER_PATH + ".tmp"
+
+    if not d:
+        # Empty ledger: still write a valid Parquet file with the schema.
+        empty = {col.name: [] for col in LEDGER_SCHEMA}
+        with pq.ParquetWriter(tmp, LEDGER_SCHEMA) as writer:
+            writer.write_batch(pa.RecordBatch.from_pydict(empty, schema=LEDGER_SCHEMA))
+    else:
+        chunk = {
+            "BADGE_A": [],
+            "BADGE_B": [],
+            "VALUES": [],
+            "HISTORICAL_N": [],
+            "HISTORICAL_MEAN": [],
+            "FIRST_DAY": [],
+            "LAST_DAY": [],
+        }
+        with pq.ParquetWriter(tmp, LEDGER_SCHEMA) as writer:
+            for (a, b), e in d.items():
+                chunk["BADGE_A"].append(a)
+                chunk["BADGE_B"].append(b)
+                chunk["VALUES"].append(e["VALUES"])
+                chunk["HISTORICAL_N"].append(e["HISTORICAL_N"])
+                chunk["HISTORICAL_MEAN"].append(e["HISTORICAL_MEAN"])
+                chunk["FIRST_DAY"].append(e["FIRST_DAY"])
+                chunk["LAST_DAY"].append(e["LAST_DAY"])
+
+                if len(chunk["BADGE_A"]) >= SAVE_CHUNK_SIZE:
+                    writer.write_batch(
+                        pa.RecordBatch.from_pydict(chunk, schema=LEDGER_SCHEMA)
+                    )
+                    for key in chunk:
+                        chunk[key].clear()
+
+            if chunk["BADGE_A"]:
+                writer.write_batch(
+                    pa.RecordBatch.from_pydict(chunk, schema=LEDGER_SCHEMA)
+                )
+
     if os.path.exists(LEDGER_PATH):
         os.remove(LEDGER_PATH)
     os.rename(tmp, LEDGER_PATH)
