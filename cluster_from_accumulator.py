@@ -44,10 +44,14 @@ V2_TREND_MIN = -0.05
 V2_MIN_DAYS = 15
 
 
-def compute_per_pair_stats(ledger):
+def compute_per_pair_stats(ledger, chunk_size=500_000):
     """
     Compute mean_r, std_r, trend, and n_recent for every pair in the
-    ledger using vectorized numpy where possible.
+    ledger using vectorized numpy, in chunks to bound peak memory.
+
+    With chunk_size=500_000 the per-chunk intermediate arrays peak
+    around ~250 MB on top of the loaded ledger, vs the ~4 GB spike
+    that an all-at-once computation would need.
 
     Returns:
         mean_r:   (n,) float32 — per-pair mean over valid window slots
@@ -56,37 +60,53 @@ def compute_per_pair_stats(ledger):
         n_recent: (n,) int16   — number of valid window slots per pair
     """
     n = ledger.n
-    daily = ledger.daily_values[:n]
     n_recent = ledger.n_recent[:n].copy()
 
-    n_days_max = daily.shape[1]
-    cols = np.arange(n_days_max)
-    valid_mask = cols[None, :] < n_recent[:, None]
-
-    n_recent_f = n_recent.astype(np.float32)
-    n_recent_safe = np.maximum(n_recent_f, 1.0)
-
-    daily_for_mean = np.where(valid_mask, daily, 0.0)
-    sums = daily_for_mean.sum(axis=1)
-    mean_r = (sums / n_recent_safe).astype(np.float32)
-
-    daily_sq = np.where(valid_mask, daily * daily, 0.0)
-    sums_sq = daily_sq.sum(axis=1)
-    mean_sq = sums_sq / n_recent_safe
-    var_r = np.maximum(mean_sq - mean_r.astype(np.float64) ** 2, 0.0)
-    std_r = np.sqrt(var_r).astype(np.float32)
-
-    # Trend requires a per-pair loop because each pair's slice depends on n_recent[i].
-    # Only compute for pairs with n_recent >= 6; others get 0.
+    mean_r = np.zeros(n, dtype=np.float32)
+    std_r = np.zeros(n, dtype=np.float32)
     trend = np.zeros(n, dtype=np.float32)
-    enough = n_recent >= 6
-    indices = np.where(enough)[0]
-    for i in indices:
-        ni = int(n_recent[i])
-        k = ni // 3
-        first_mean = float(daily[i, :k].mean())
-        last_mean = float(daily[i, ni - k : ni].mean())
-        trend[i] = last_mean - first_mean
+
+    n_days_max = ledger.daily_values.shape[1]
+    cols = np.arange(n_days_max)
+
+    n_chunks = (n + chunk_size - 1) // chunk_size
+    for chunk_idx, start in enumerate(range(0, n, chunk_size), 1):
+        end = min(start + chunk_size, n)
+        print(f"    chunk {chunk_idx}/{n_chunks}: pairs {start:,}-{end:,}")
+
+        daily = ledger.daily_values[start:end]
+        n_recent_chunk = n_recent[start:end]
+
+        n_recent_f = n_recent_chunk.astype(np.float32)
+        n_recent_safe = np.maximum(n_recent_f, 1.0)
+
+        valid_mask = cols[None, :] < n_recent_chunk[:, None]
+
+        daily_zeroed = np.where(valid_mask, daily, 0.0)
+        sums = daily_zeroed.sum(axis=1)
+        chunk_mean = sums / n_recent_safe
+        mean_r[start:end] = chunk_mean.astype(np.float32)
+
+        # std using E[X^2] - E[X]^2. Square in-place on the zeroed array
+        # to avoid a second 2 GB allocation.
+        np.square(daily_zeroed, out=daily_zeroed)
+        sums_sq = daily_zeroed.sum(axis=1)
+        mean_sq = sums_sq / n_recent_safe
+        var_r = np.maximum(mean_sq - chunk_mean.astype(np.float64) ** 2, 0.0)
+        std_r[start:end] = np.sqrt(var_r).astype(np.float32)
+
+        # Trend: per-pair loop within the chunk because each pair's
+        # slice bounds depend on n_recent[i].
+        enough = n_recent_chunk >= 6
+        for i_chunk in np.where(enough)[0]:
+            ni = int(n_recent_chunk[i_chunk])
+            k = ni // 3
+            first_mean = float(daily[i_chunk, :k].mean())
+            last_mean = float(daily[i_chunk, ni - k : ni].mean())
+            trend[start + i_chunk] = last_mean - first_mean
+
+        del daily_zeroed, valid_mask, sums, sums_sq, mean_sq, var_r, chunk_mean
+        gc.collect()
 
     return mean_r, std_r, trend, n_recent
 
