@@ -53,6 +53,11 @@ def main():
         help="Only process parquets with date >= this YYYY-MM-DD. Overrides --all.",
     )
     parser.add_argument(
+        "--to-date",
+        default=None,
+        help="Only process parquets with date <= this YYYY-MM-DD.",
+    )
+    parser.add_argument(
         "--resume",
         action="store_true",
         help="Continue from an existing ledger rather than starting fresh.",
@@ -67,6 +72,9 @@ def main():
         files = [f for f in files if day_label_from_path(f) >= args.from_date]
     elif not args.all:
         files = files[-WINDOW_DAYS:]
+
+    if args.to_date:
+        files = [f for f in files if day_label_from_path(f) <= args.to_date]
 
     if not files:
         raise SystemExit("No parquets match the requested range.")
