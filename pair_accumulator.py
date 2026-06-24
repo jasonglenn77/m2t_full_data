@@ -7,9 +7,12 @@ WINDOW_DAYS most recent daily Pearson values, plus historical metadata.
 Daily values older than WINDOW_DAYS days drop off — this is the
 structural protection against stickiness.
 
-In-memory storage: PairLedger class with parallel numpy arrays + a
-(BADGE_A, BADGE_B) -> row_index lookup dict. For 11.7M pairs this uses
-~7 GB instead of ~15 GB for the previous dict-of-dicts representation.
+In-memory storage: PairLedger class with parallel numpy arrays plus a
+sorted int64-keyed lookup array (replacing an earlier dict). For 11.7M
+pairs total RAM is ~2.7 GB; the lookup structure itself is ~140 MB
+(vs ~1.7 GB for a Python dict of tuple keys). Badges are assumed to
+be numeric strings that fit in 32 bits, which the pipeline's badge IDs
+satisfy.
 
 On-disk storage: data/state/pair_ledger.parquet
     BADGE_A (str)         -- always BADGE_A < BADGE_B
@@ -71,15 +74,21 @@ class PairLedger:
         first_day:       object array of 'YYYY-MM-DD' strings
         last_day:        object array of 'YYYY-MM-DD' strings
 
-    index: dict {(BADGE_A, BADGE_B): row_index} for fast pair lookup.
+    Lookup: pairs are addressed by an int64 packed key
+    (int(BADGE_A) << 32) | int(BADGE_B) with the badges already in
+    canonical order (a < b). Sorted in _sorted_keys/_sorted_rows so
+    lookups use numpy.searchsorted (O(log n) but vectorizable). New
+    pairs are first parked in _pending (a small Python dict) and
+    periodically merged into the sorted arrays via _flush_pending().
     """
 
     INITIAL_CAPACITY = 13_000_000
+    # Maximum size of the pending-insert buffer before we re-sort.
+    PENDING_FLUSH_THRESHOLD = 50_000
 
     def __init__(self, capacity=None):
         self.n = 0
         self.capacity = 0
-        self.index = {}
         self.badge_a = None
         self.badge_b = None
         self.daily_values = None
@@ -88,6 +97,11 @@ class PairLedger:
         self.historical_mean = None
         self.first_day = None
         self.last_day = None
+        # Sorted-array lookup (replaces the old Python dict).
+        self._sorted_keys = np.empty(0, dtype=np.int64)
+        self._sorted_rows = np.empty(0, dtype=np.int32)
+        # Newly-inserted pairs waiting to be merged into the sorted arrays.
+        self._pending = {}
         self._grow(capacity or self.INITIAL_CAPACITY)
 
     def __len__(self):
@@ -140,26 +154,92 @@ class PairLedger:
         self.last_day = new_last_day
         self.capacity = target_capacity
 
+    @staticmethod
+    def _pack_key(a_str, b_str):
+        """Return the int64 packed key for a canonical pair. Returns None
+        for non-numeric badge IDs (those can't use the int-packed index
+        and must stay in the _pending fallback dict)."""
+        try:
+            a_int = int(a_str)
+            b_int = int(b_str)
+        except (TypeError, ValueError):
+            return None
+        if a_int > b_int:
+            a_int, b_int = b_int, a_int
+        return (a_int << 32) | b_int
+
+    def _lookup_row(self, a_str, b_str):
+        """Return the row index for (a, b) if known, else -1.
+        Checks the pending buffer first (recent inserts), then the
+        sorted array via binary search."""
+        if a_str > b_str:
+            a_str, b_str = b_str, a_str
+        pair = (a_str, b_str)
+        row = self._pending.get(pair, -1)
+        if row != -1:
+            return row
+        key = self._pack_key(a_str, b_str)
+        if key is None or self._sorted_keys.size == 0:
+            return -1
+        idx = np.searchsorted(self._sorted_keys, key)
+        if idx < self._sorted_keys.size and int(self._sorted_keys[idx]) == key:
+            return int(self._sorted_rows[idx])
+        return -1
+
+    def _flush_pending(self):
+        """Merge the _pending buffer into the sorted arrays. Idempotent."""
+        if not self._pending:
+            return
+        packed_keys = []
+        rows = []
+        non_numeric = {}
+        for (a, b), row in self._pending.items():
+            key = self._pack_key(a, b)
+            if key is None:
+                # Non-numeric badge IDs can't be packed; keep them in the
+                # buffer (small, lookups still hit the pending dict).
+                non_numeric[(a, b)] = row
+                continue
+            packed_keys.append(key)
+            rows.append(row)
+        if packed_keys:
+            new_keys_arr = np.array(packed_keys, dtype=np.int64)
+            new_rows_arr = np.array(rows, dtype=np.int32)
+            if self._sorted_keys.size == 0:
+                merged_keys = new_keys_arr
+                merged_rows = new_rows_arr
+            else:
+                merged_keys = np.concatenate([self._sorted_keys, new_keys_arr])
+                merged_rows = np.concatenate([self._sorted_rows, new_rows_arr])
+            order = np.argsort(merged_keys, kind="mergesort")
+            self._sorted_keys = merged_keys[order]
+            self._sorted_rows = merged_rows[order]
+        self._pending = non_numeric
+
     def update(self, badge_a, badge_b, r, day):
         """
         Apply one pair's correlation for a given day.
 
         Idempotent for re-runs of the same day: if LAST_DAY >= day, skip.
 
-        For new pairs: append a fresh entry.
+        For new pairs: append a fresh entry to ledger arrays and stash the
+        (pair -> row) mapping in _pending; pending is merged into the
+        sorted arrays periodically.
         For existing pairs: append r to the rolling window, trim to
         WINDOW_DAYS most recent values, update historical running stats.
         """
         if badge_b < badge_a:
             badge_a, badge_b = badge_b, badge_a
-        key = (badge_a, badge_b)
-        idx = self.index.get(key)
 
-        if idx is None:
+        if len(self._pending) >= self.PENDING_FLUSH_THRESHOLD:
+            self._flush_pending()
+
+        idx = self._lookup_row(badge_a, badge_b)
+
+        if idx == -1:
             if self.n >= self.capacity:
                 self._grow(max(self.capacity + 1, int(self.capacity * 1.5)))
             idx = self.n
-            self.index[key] = idx
             self.n += 1
             self.badge_a[idx] = badge_a
             self.badge_b[idx] = badge_b
@@ -169,6 +249,7 @@ class PairLedger:
             self.historical_mean[idx] = float(r)
             self.first_day[idx] = day
             self.last_day[idx] = day
+            self._pending[(badge_a, badge_b)] = idx
             return
 
         if self.last_day[idx] >= day:
@@ -201,6 +282,12 @@ class PairLedger:
         Stream to Parquet in SAVE_CHUNK_SIZE-row batches. Atomically replaces
         LEDGER_PATH via a .tmp file.
         """
+        # Make sure recently-inserted pairs are searchable on next load
+        # by being represented in the on-disk row order (no work needed —
+        # the rows themselves are already in self.badge_a/b at their final
+        # indices), but flush the in-memory lookup so it's consistent.
+        self._flush_pending()
+
         os.makedirs(LEDGER_DIR, exist_ok=True)
         tmp = LEDGER_PATH + ".tmp"
 
@@ -257,6 +344,13 @@ class PairLedger:
         n_total = parquet_file.metadata.num_rows
         ledger = cls(capacity=max(cls.INITIAL_CAPACITY, int(n_total * 1.2) + 1))
 
+        # Build the sorted-key lookup directly during load — never
+        # materialize a Python dict of all 11M+ pairs (that's ~1.7 GB of
+        # overhead the machine doesn't have). Non-numeric badges (rare)
+        # fall back to the _pending dict.
+        all_keys = np.empty(n_total, dtype=np.int64)
+        all_keys_valid = np.zeros(n_total, dtype=bool)
+
         offset = 0
         for batch in parquet_file.iter_batches(batch_size=LOAD_CHUNK_SIZE):
             n_batch = batch.num_rows
@@ -274,7 +368,12 @@ class PairLedger:
             ledger.badge_b[offset:end] = badge_b_arr
 
             for i, (a, b) in enumerate(zip(badge_a_arr, badge_b_arr)):
-                ledger.index[(a, b)] = offset + i
+                key = cls._pack_key(a, b)
+                if key is None:
+                    ledger._pending[(a, b)] = offset + i
+                else:
+                    all_keys[offset + i] = key
+                    all_keys_valid[offset + i] = True
 
             for i, vals in enumerate(values_arr):
                 cur_n = len(vals)
@@ -297,6 +396,15 @@ class PairLedger:
             gc.collect()
 
         ledger.n = offset
+
+        # Sort the int64 keys for searchsorted-based lookup
+        valid_keys = all_keys[:offset][all_keys_valid[:offset]]
+        valid_rows = np.where(all_keys_valid[:offset])[0].astype(np.int32)
+        order = np.argsort(valid_keys, kind="mergesort")
+        ledger._sorted_keys = valid_keys[order]
+        ledger._sorted_rows = valid_rows[order]
+        del all_keys, all_keys_valid, valid_keys, valid_rows, order
+        gc.collect()
         return ledger
 
 
