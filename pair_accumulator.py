@@ -52,7 +52,10 @@ LEDGER_SCHEMA = pa.schema(
 )
 
 SAVE_CHUNK_SIZE = 500_000
-LOAD_CHUNK_SIZE = 500_000
+# Small load batches keep per-iteration Python-object allocations modest
+# so the load works on memory-constrained machines. 50K rows of objects
+# is ~6 MB of strings instead of ~60 MB at 500K.
+LOAD_CHUNK_SIZE = 50_000
 
 
 def canonical_pair(a, b):
@@ -119,7 +122,9 @@ class PairLedger:
         )
         new_n_recent = np.zeros(target_capacity, dtype=np.int16)
         new_historical_n = np.zeros(target_capacity, dtype=np.int32)
-        new_historical_mean = np.zeros(target_capacity, dtype=np.float64)
+        # float32 plenty for a running mean bounded in [-1, 1] and saves
+        # 50 MB at 13M capacity vs float64.
+        new_historical_mean = np.zeros(target_capacity, dtype=np.float32)
         new_first_day = np.empty(target_capacity, dtype=object)
         new_last_day = np.empty(target_capacity, dtype=object)
 
@@ -383,7 +388,7 @@ class PairLedger:
 
             ledger.historical_n[offset:end] = historical_n_arr.astype(np.int32)
             ledger.historical_mean[offset:end] = historical_mean_arr.astype(
-                np.float64
+                np.float32
             )
             ledger.first_day[offset:end] = first_day_arr
             ledger.last_day[offset:end] = last_day_arr
