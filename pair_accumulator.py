@@ -402,13 +402,26 @@ class PairLedger:
 
         ledger.n = offset
 
-        # Sort the int64 keys for searchsorted-based lookup
-        valid_keys = all_keys[:offset][all_keys_valid[:offset]]
-        valid_rows = np.where(all_keys_valid[:offset])[0].astype(np.int32)
+        # Sort the int64 keys for searchsorted-based lookup.
+        # Fast path: if every loaded pair is numeric (the normal case),
+        # skip the np.where filter entirely — that avoids allocating an
+        # intermediate ~90 MB int64 index array we don't actually need.
+        n_valid = int(all_keys_valid[:offset].sum())
+        if n_valid == offset:
+            valid_keys = all_keys[:offset]
+            valid_rows = np.arange(offset, dtype=np.int32)
+            del all_keys_valid
+        else:
+            valid_idx = np.where(all_keys_valid[:offset])[0]
+            valid_keys = all_keys[valid_idx]
+            valid_rows = valid_idx.astype(np.int32)
+            del all_keys_valid, valid_idx
+        del all_keys
+        gc.collect()
         order = np.argsort(valid_keys, kind="mergesort")
         ledger._sorted_keys = valid_keys[order]
         ledger._sorted_rows = valid_rows[order]
-        del all_keys, all_keys_valid, valid_keys, valid_rows, order
+        del valid_keys, valid_rows, order
         gc.collect()
         return ledger
 
