@@ -194,6 +194,8 @@ def apply_updates_to_ledger(ledger, pair_updates, day_label):
 
 
 def main(parquet_path):
+    from streaming_update import stream_update_ledger
+
     day_label = day_label_from_path(parquet_path)
     print(f"Computing daily correlations for {day_label} ...")
 
@@ -203,13 +205,11 @@ def main(parquet_path):
     pair_updates = compute_daily_correlations(badges, signatures, lats, lons)
     print(f"  {len(pair_updates):,} pair correlations computed")
 
-    print("  Loading ledger ...")
-    ledger = PairLedger.load()
+    del badges, signatures, lats, lons
+    gc.collect()
 
-    apply_updates_to_ledger(ledger, pair_updates, day_label)
-
-    print(f"  Writing ledger ({len(ledger):,} unique pairs) ...")
-    ledger.save()
+    print("  Streaming ledger update ...")
+    stream_update_ledger(day_label, pair_updates)
     print("Done.")
 
 

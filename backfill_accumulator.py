@@ -1,46 +1,44 @@
 # backfill_accumulator.py
 """
-Replay daily parquets in chronological order through the v2 daily
-correlator to build up the pair ledger from scratch.
+Replay daily parquets in chronological order through the streaming
+ledger update path to build up (or catch up) the v2 pair ledger.
 
-Unlike running daily_correlate.py per file, this keeps the ledger in
-memory across days and only saves periodically — much faster for the
-initial backfill because we avoid re-parsing the full ledger between
-days.
+Uses streaming_update.stream_update_ledger for each day: never loads
+the full ~12M-pair ledger into memory. Peak memory is ~500 MB per day
+regardless of ledger size, which lets the backfill run on a memory-
+constrained machine alongside other work.
+
+Trade-off vs the old in-memory design: each day pays a full sequential
+re-read of the ledger from disk (~1-2 min). For a 7-day weekly batch
+that's under 15 min of extra I/O.
 
 By default starts from the most recent WINDOW_DAYS parquets, matching
 the v1 model's window. Use --all to process every parquet in
 data/raw/daily/ instead.
 
 Usage:
-    python backfill_accumulator.py [--save-every N] [--all] [--from-date YYYY-MM-DD]
+    python backfill_accumulator.py [--all] [--from-date YYYY-MM-DD]
+                                    [--to-date YYYY-MM-DD] [--resume]
 """
 
 import argparse
 import gc
 import glob
 import os
-import sys
 
 from config import DAILY_RAW_DIR, WINDOW_DAYS
 from daily_correlate import (
-    apply_updates_to_ledger,
     compute_daily_correlations,
     day_label_from_path,
     read_day_signatures,
 )
-from pair_accumulator import LEDGER_PATH, PairLedger
+from pair_accumulator import LEDGER_PATH
+from streaming_update import get_most_recent_day, stream_update_ledger
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Backfill the v2 pair ledger from daily parquets."
-    )
-    parser.add_argument(
-        "--save-every",
-        type=int,
-        default=5,
-        help="Save the ledger to disk every N days during backfill (default 5).",
+        description="Backfill the v2 pair ledger from daily parquets (streaming)."
     )
     parser.add_argument(
         "--all",
@@ -60,7 +58,7 @@ def main():
     parser.add_argument(
         "--resume",
         action="store_true",
-        help="Continue from an existing ledger rather than starting fresh.",
+        help="Continue from an existing ledger (skip days already applied) rather than starting fresh.",
     )
     args = parser.parse_args()
 
@@ -81,12 +79,11 @@ def main():
 
     print(f"Backfill plan: {len(files)} parquets")
     print(f"  Range: {day_label_from_path(files[0])} -> {day_label_from_path(files[-1])}")
-    print(f"  Save every {args.save_every} day(s)")
+    print(f"  Update mode: streaming per-day (peak memory ~500 MB)")
 
     if args.resume and os.path.exists(LEDGER_PATH):
         print(f"  Resuming from existing ledger at {LEDGER_PATH}")
-        ledger = PairLedger.load()
-        most_recent = ledger.most_recent_day()
+        most_recent = get_most_recent_day()
         if most_recent:
             print(f"  Ledger's most recent day: {most_recent}")
             before = len(files)
@@ -98,7 +95,6 @@ def main():
             if not files:
                 print("Nothing to do; ledger is already up to date.")
                 return
-        print(f"  Loaded {len(ledger):,} pairs into in-memory ledger")
     else:
         if os.path.exists(LEDGER_PATH):
             confirm = (
@@ -112,7 +108,7 @@ def main():
             if confirm != "yes":
                 print("Aborted.")
                 return
-        ledger = PairLedger()
+            os.remove(LEDGER_PATH)
 
     print()
 
@@ -126,19 +122,16 @@ def main():
         pair_updates = compute_daily_correlations(badges, signatures, lats, lons)
         print(f"  {len(pair_updates):,} pair correlations")
 
-        apply_updates_to_ledger(ledger, pair_updates, day)
-        print(f"  Ledger now {len(ledger):,} unique pairs")
-
-        del badges, signatures, lats, lons, pair_updates
+        del badges, signatures, lats, lons
         gc.collect()
 
-        if i % args.save_every == 0 or i == len(files):
-            print(f"  Saving ledger ...")
-            ledger.save()
+        stream_update_ledger(day, pair_updates)
+
+        del pair_updates
+        gc.collect()
 
     print()
-    print(f"Backfill complete. Final ledger: {len(ledger):,} unique pairs.")
-    print(f"Saved to: {LEDGER_PATH}")
+    print(f"Backfill complete. Ledger saved to: {LEDGER_PATH}")
 
 
 if __name__ == "__main__":
