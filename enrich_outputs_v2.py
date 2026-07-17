@@ -62,6 +62,7 @@ def haversine_m(lat1, lon1, lat2, lon2):
 def load_service_points(path):
     cols = [
         "BADGENUMBER",
+        "SPID",
         "TRANSFORMERBANKOBJECTID",
         "TRANSBANKTAG",
         "CCBADDRESS1",
@@ -86,6 +87,7 @@ def load_service_points(path):
 def load_transformers(path):
     cols = [
         "TAG",
+        "LID",
         "STRUCTNO",
         "FEEDERID",
         "d_FEEDERID",
@@ -183,6 +185,7 @@ def enrich_file(input_path, output_path, sp, tx_lookup, model_latlon):
 
     sp_badge_cols = {
         "BADGENUMBER": "BADGE",
+        "SPID": "BADGE_SPID",
         "CCBADDRESS1": "BADGE_ADDRESS",
         "CCBCITY": "BADGE_CITY",
         "POINT_Y": "GIS_BADGE_LAT",
@@ -210,6 +213,7 @@ def enrich_file(input_path, output_path, sp, tx_lookup, model_latlon):
     cur_cols = {
         "TRANSFORMERBANKOBJECTID": "CURRENT_TRANSFORMER",
         "STRUCTNO": "CURRENT_TX_STRUCTNO",
+        "LID": "CURRENT_TX_LID",
         "FEEDERID": "CURRENT_TX_FEEDERID_RAW",
         "d_FEEDERID": "CURRENT_TX_FEEDERID",
         "d_SUBTYPECD": "CURRENT_TX_SUBTYPE",
@@ -224,6 +228,7 @@ def enrich_file(input_path, output_path, sp, tx_lookup, model_latlon):
     rec_cols = {
         "TRANSFORMERBANKOBJECTID": "RECOMMENDED_TRANSFORMER",
         "STRUCTNO": "RECOMMENDED_TX_STRUCTNO",
+        "LID": "RECOMMENDED_TX_LID",
         "FEEDERID": "RECOMMENDED_TX_FEEDERID_RAW",
         "d_FEEDERID": "RECOMMENDED_TX_FEEDERID",
         "d_SUBTYPECD": "RECOMMENDED_TX_SUBTYPE",
@@ -375,6 +380,7 @@ def write_full_clusters_enriched(sp, model_latlon):
 
     sp_cols = {
         "BADGENUMBER": "BADGE",
+        "SPID": "BADGE_SPID",
         "CCBADDRESS1": "BADGE_ADDRESS",
         "CCBCITY": "BADGE_CITY",
         "POINT_X": "BADGE_POINT_X",
@@ -397,6 +403,7 @@ def write_full_clusters_enriched(sp, model_latlon):
 
     cols = [
         "BADGE",
+        "BADGE_SPID",
         "CLUSTER",
         "CLUSTER_SIZE",
         "GIS_TRANSFORMER",
