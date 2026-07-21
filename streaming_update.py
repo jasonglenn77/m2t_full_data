@@ -187,13 +187,26 @@ def stream_update_ledger(day_label, pair_updates):
     n_new = 0
 
     tmp = LEDGER_PATH + ".tmp"
-    reader = pq.ParquetFile(LEDGER_PATH)
-    total_rows = reader.metadata.num_rows
-    log_every = max(500_000, total_rows // 20)
+    # Clean up leftover .tmp from a prior crashed run so the writer
+    # can start fresh.
+    if os.path.exists(tmp):
+        os.remove(tmp)
+
+    # Open the ledger file with an explicit handle we control. Passing
+    # a filesystem path to pq.ParquetFile leaves handle-release timing
+    # up to pyarrow's internals — on Windows that lets the underlying
+    # OS handle outlive the reader object, and os.remove() below then
+    # fails with PermissionError. The `with` block guarantees closure
+    # before we swap.
     rows_processed = 0
     rows_last_log = 0
 
-    with pq.ParquetWriter(tmp, LEDGER_SCHEMA) as writer:
+    with open(LEDGER_PATH, "rb") as ledger_fh, \
+            pq.ParquetWriter(tmp, LEDGER_SCHEMA) as writer:
+        reader = pq.ParquetFile(ledger_fh)
+        total_rows = reader.metadata.num_rows
+        log_every = max(500_000, total_rows // 20)
+
         for batch in reader.iter_batches(batch_size=STREAM_CHUNK_SIZE):
             n_batch = batch.num_rows
             badge_a_batch = batch.column("BADGE_A").to_pylist()
@@ -297,6 +310,9 @@ def stream_update_ledger(day_label, pair_updates):
             _write_new_pairs(writer, pair_updates, new_indices, day_label)
 
     del sorted_keys, sorted_rs, sorted_orig, non_numeric, matched
+    # Extra paranoia — ledger_fh is closed by the `with` above, but drop
+    # the reader reference too and force a collect before the swap.
+    reader = None
     gc.collect()
 
     if os.path.exists(LEDGER_PATH):
