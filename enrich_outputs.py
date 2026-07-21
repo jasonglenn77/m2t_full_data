@@ -100,20 +100,58 @@ def haversine_m(lat1, lon1, lat2, lon2):
     return 2 * EARTH_R * np.arcsin(np.sqrt(a))
 
 
+SP_DESIRED_COLS = [
+    "BADGENUMBER",
+    "SPID",
+    "TRANSFORMERBANKOBJECTID",
+    "TRANSBANKTAG",
+    "CCBADDRESS1",
+    "CCBCITY",
+    "FEEDERID",
+    "d_FEEDERID",
+]
+SP_COORD_ALIASES = {"SP_X": "POINT_X", "SP_Y": "POINT_Y"}
+
+TX_DESIRED_COLS = [
+    "OBJECTID",
+    "TAG",
+    "LID",
+    "STRUCTNO",
+    "FEEDERID",
+    "d_FEEDERID",
+    "d_SUBTYPECD",
+    "VAULTCD",
+    "TOTALKVA",
+]
+TX_COORD_ALIASES = {"XFER_X": "POINT_X", "XFER_Y": "POINT_Y"}
+
+
+def _read_columns_present(path, desired, coord_aliases):
+    """Return the subset of `desired` present in the file, plus coordinate
+    aliases mapped to canonical POINT_X / POINT_Y names."""
+    header = pd.read_csv(path, dtype=str, nrows=0).columns.tolist()
+    to_load = [c for c in desired if c in header]
+    for src in ("POINT_X", "POINT_Y"):
+        if src in header:
+            to_load.append(src)
+    rename = {}
+    for alias, canonical in coord_aliases.items():
+        if alias in header and canonical not in header:
+            to_load.append(alias)
+            rename[alias] = canonical
+    return to_load, rename, header
+
+
 def load_service_points(path):
-    cols = [
-        "BADGENUMBER",
-        "SPID",
-        "TRANSFORMERBANKOBJECTID",
-        "TRANSBANKTAG",
-        "CCBADDRESS1",
-        "CCBCITY",
-        "POINT_X",
-        "POINT_Y",
-        "FEEDERID",
-        "d_FEEDERID",
-    ]
-    sp = pd.read_csv(path, dtype=str, usecols=cols, low_memory=False)
+    to_load, rename, _ = _read_columns_present(
+        path, SP_DESIRED_COLS, SP_COORD_ALIASES
+    )
+    sp = pd.read_csv(path, dtype=str, usecols=to_load, low_memory=False)
+    if rename:
+        sp = sp.rename(columns=rename)
+    for c in ("TRANSBANKTAG", "d_FEEDERID", "SPID"):
+        if c not in sp.columns:
+            sp[c] = pd.NA
     sp = sp.dropna(subset=["BADGENUMBER"]).copy()
     sp["BADGENUMBER"] = sp["BADGENUMBER"].astype(str).str.strip()
     sp["TRANSFORMERBANKOBJECTID"] = normalize_id(sp["TRANSFORMERBANKOBJECTID"])
@@ -126,34 +164,154 @@ def load_service_points(path):
 
 
 def load_transformers(path):
-    cols = [
-        "TAG",
-        "LID",
-        "STRUCTNO",
-        "FEEDERID",
-        "d_FEEDERID",
-        "d_SUBTYPECD",
-        "VAULTCD",
-        "POINT_X",
-        "POINT_Y",
-        "TOTALKVA",
-    ]
-    tx = pd.read_csv(path, dtype=str, usecols=cols, low_memory=False)
-    tx["TAG"] = tx["TAG"].astype(str).str.strip()
-    tx = tx.dropna(subset=["TAG"]).copy()
-    tx = tx.sort_values("TAG").drop_duplicates(subset=["TAG"], keep="first")
+    to_load, rename, header = _read_columns_present(
+        path, TX_DESIRED_COLS, TX_COORD_ALIASES
+    )
+    tx = pd.read_csv(path, dtype=str, usecols=to_load, low_memory=False)
+    if rename:
+        tx = tx.rename(columns=rename)
+    for c in ("TAG", "STRUCTNO", "d_FEEDERID", "d_SUBTYPECD"):
+        if c not in tx.columns:
+            tx[c] = pd.NA
+    if "OBJECTID" in tx.columns:
+        tx["OBJECTID"] = normalize_id(tx["OBJECTID"])
+        tx = tx.dropna(subset=["OBJECTID"]).copy()
+        tx = tx.sort_values("OBJECTID").drop_duplicates(
+            subset=["OBJECTID"], keep="first"
+        )
+    else:
+        tx["TAG"] = tx["TAG"].astype(str).str.strip()
+        tx = tx.dropna(subset=["TAG"]).copy()
+        tx = tx.sort_values("TAG").drop_duplicates(subset=["TAG"], keep="first")
     return tx
 
 
 def build_tx_id_lookup(sp, tx):
+    """Bridge ServicePoint records to their transformer metadata.
+
+    Prefers OBJECTID-based join (SP.TRANSFORMERBANKOBJECTID -> TX.OBJECTID)
+    when the transformer file exposes OBJECTID — that path gives 100%
+    coverage on the current dataflow schema. Falls back to the older
+    TAG-based join (SP.TRANSBANKTAG -> TX.TAG) for legacy files that
+    predate OBJECTID."""
+    if "OBJECTID" in tx.columns:
+        bridge = (
+            sp[["TRANSFORMERBANKOBJECTID"]]
+            .dropna()
+            .drop_duplicates()
+            .copy()
+        )
+        tx_with_id = bridge.merge(
+            tx, left_on="TRANSFORMERBANKOBJECTID", right_on="OBJECTID", how="left"
+        )
+        return tx_with_id.drop(columns=["OBJECTID"]).copy()
+
     bridge = (
         sp[["TRANSFORMERBANKOBJECTID", "TRANSBANKTAG"]]
         .dropna(subset=["TRANSFORMERBANKOBJECTID", "TRANSBANKTAG"])
         .drop_duplicates(subset=["TRANSFORMERBANKOBJECTID"], keep="first")
     )
     tx_with_id = bridge.merge(tx, left_on="TRANSBANKTAG", right_on="TAG", how="left")
-    tx_with_id = tx_with_id.drop(columns=["TAG"]).copy()
-    return tx_with_id
+    return tx_with_id.drop(columns=["TAG"]).copy()
+
+
+def _find_decoder_file(pattern, required_cols, exclude_path):
+    """Return the newest GIS file matching pattern (other than exclude_path)
+    that contains all of required_cols in its header. None if no match."""
+    candidates = sorted(
+        glob.glob(os.path.join(GIS_DIR, pattern)),
+        key=os.path.getmtime,
+        reverse=True,
+    )
+    exclude_abs = os.path.abspath(exclude_path) if exclude_path else None
+    for f in candidates:
+        if exclude_abs and os.path.abspath(f) == exclude_abs:
+            continue
+        try:
+            header = pd.read_csv(f, dtype=str, nrows=0).columns.tolist()
+        except Exception:
+            continue
+        if all(c in header for c in required_cols):
+            return f
+    return None
+
+
+def build_tx_decoder(tx, primary_tx_path):
+    """Build a LID-keyed lookup from an older Transformers file to fill in
+    STRUCTNO / TAG / d_FEEDERID / d_SUBTYPECD for transformers already known
+    at the time the older file was exported. Returns None if the current
+    file already has everything or no suitable decoder file exists."""
+    if "LID" not in tx.columns:
+        return None
+    wanted = ["STRUCTNO", "TAG", "d_FEEDERID", "d_SUBTYPECD"]
+    missing = [c for c in wanted if c not in tx.columns or tx[c].isna().all()]
+    if not missing:
+        return None
+    decoder_path = _find_decoder_file(
+        "Transformers*.csv", ["LID"] + missing, primary_tx_path
+    )
+    if decoder_path is None:
+        return None
+    dec = pd.read_csv(
+        decoder_path, dtype=str, usecols=["LID"] + missing, low_memory=False
+    )
+    dec["LID"] = dec["LID"].astype(str).str.strip()
+    dec = dec.dropna(subset=["LID"]).drop_duplicates(
+        subset=["LID"], keep="first"
+    )
+    print(
+        f"    Transformer decoder: {os.path.basename(decoder_path)} "
+        f"({len(dec):,} rows, columns: {missing})"
+    )
+    return dec
+
+
+def build_sp_decoder(sp, primary_sp_path):
+    """Build a FEEDERID-keyed lookup from an older ServicePoints file to
+    fill in d_FEEDERID (human-readable feeder name). Returns None if not
+    needed or unavailable."""
+    if "FEEDERID" not in sp.columns:
+        return None
+    wanted = ["d_FEEDERID"]
+    missing = [c for c in wanted if c not in sp.columns or sp[c].isna().all()]
+    if not missing:
+        return None
+    decoder_path = _find_decoder_file(
+        "ServicePoints*.csv", ["FEEDERID"] + missing, primary_sp_path
+    )
+    if decoder_path is None:
+        return None
+    dec = pd.read_csv(
+        decoder_path, dtype=str, usecols=["FEEDERID"] + missing, low_memory=False
+    )
+    dec["FEEDERID"] = dec["FEEDERID"].astype(str).str.strip()
+    dec = dec.dropna(subset=["FEEDERID"]).drop_duplicates(
+        subset=["FEEDERID"], keep="first"
+    )
+    print(
+        f"    ServicePoints decoder: {os.path.basename(decoder_path)} "
+        f"({len(dec):,} rows, columns: {missing})"
+    )
+    return dec
+
+
+def _apply_decoder(df, decoder, join_key):
+    """Merge decoder columns into df, filling values only where df is
+    missing or all-NaN. Non-destructive to columns already populated."""
+    if decoder is None or join_key not in df.columns:
+        return df
+    result = df.copy()
+    result[join_key] = result[join_key].astype(str).str.strip()
+    add_cols = []
+    for c in decoder.columns:
+        if c == join_key:
+            continue
+        if c not in result.columns or result[c].isna().all():
+            add_cols.append(c)
+    if not add_cols:
+        return result
+    result = result.drop(columns=[c for c in add_cols if c in result.columns])
+    return result.merge(decoder[[join_key] + add_cols], on=join_key, how="left")
 
 
 def load_model_latlon():
@@ -543,6 +701,14 @@ def main():
 
     sp = load_service_points(sp_path)
     tx = load_transformers(tx_path)
+
+    sp_decoder = build_sp_decoder(sp, sp_path)
+    tx_decoder = build_tx_decoder(tx, tx_path)
+    if sp_decoder is not None:
+        sp = _apply_decoder(sp, sp_decoder, "FEEDERID")
+    if tx_decoder is not None:
+        tx = _apply_decoder(tx, tx_decoder, "LID")
+
     tx_lookup = build_tx_id_lookup(sp, tx)
     model_latlon = load_model_latlon()
     print(
