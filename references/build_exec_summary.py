@@ -351,12 +351,10 @@ def main():
             "field crews and the application team can join model "
             "recommendations against their own systems more directly.",
             "Completed a memory-efficiency rewrite of the second "
-            "(parallel) model's daily update path. Previously the "
-            "weekly update needed a dedicated machine; now it runs "
-            "alongside other work with roughly one-sixth the memory "
-            "footprint. This unblocked two additional weekly runs "
-            "and puts the parallel model on the same cadence as the "
-            "production model.",
+            "(parallel) model's daily update path — peak memory "
+            "dropped by roughly six-fold. This unblocked two "
+            "additional weekly runs and put the parallel model on "
+            "the same weekly cadence as the production model.",
             "Grew the stability ledger from seven runs to nine. The "
             "additional history sharpens the high-confidence filter — "
             "recommendations that survive nine consecutive weeks of "
