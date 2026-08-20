@@ -8,6 +8,11 @@ data/raw/daily/*.parquet
 # Ignore large numpy file
 data/processed/signatures/signatures.npy
 
+# v2 pair ledger — ~3 GB, far over GitHub's 100 MB hard limit. It was only
+# ever untracked, which left it one `git add -A` away from wrecking the repo.
+data/state/pair_ledger.parquet
+data/state/pair_ledger.parquet.tmp
+
 # Raw GIS source files (ServicePoints can exceed GitHub's 100 MB hard limit)
 GIS_mapping/*.csv
 
