@@ -241,13 +241,61 @@ the tier counts show a non-trivial `both_high_confidence` number.
 
 ---
 
-## Ongoing weekly routine
+## Ongoing weekly routine — every Monday
+
+`run_monday.ps1` does the whole thing. It computes the week from today's
+date (the most recent Sunday, and the Monday six days before it), so
+nothing needs editing week to week.
 
 ```powershell
-python save_daily_data.py                      # pull the new week's parquets
-python build_known_mapping.py                  # only if new GIS arrived
-.\run_weeks.ps1 -Through <this Friday's date>
+cd "C:\Users\jsglenn\OneDrive - Colorado Springs Utilities\Apps\Python\New_M2T_260310"
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
+
+.\run_monday.ps1 -DryRun     # confirm the week it picked
+.\run_monday.ps1
 ```
+
+Six phases, in order. Budget 4–6 hours.
+
+| Phase | What it does |
+|---|---|
+| `gis` | Pauses for you to drop the new GIS CSVs in, confirms the right files won, rebuilds `known_mapping.csv` |
+| `extract` | Pulls the week's parquets from C2M (calls `run_daily_extract` directly — `save_daily_data.py` never needs its dates edited) |
+| `v2` | `run_weeks.ps1` for the week: ledger, pipeline, weekly archive |
+| `v1` | Advances the signature window 7 days, runs the v1 pipeline |
+| `consensus` | `consensus_report.py`, then `build_deliverable.py` |
+| `verify` | Coverage check and stability summary |
+
+Useful switches:
+
+| Switch | When |
+|---|---|
+| `-SkipGis` | No new GIS export this week |
+| `-SkipExtract` | Parquets already loaded |
+| `-SkipV1` | v2 only — much faster, but no consensus report |
+| `-StartAt v1` | Resume after a failure (`gis`, `extract`, `v2`, `v1`, `consensus`, `verify`) |
+| `-WeekEnd 2026-08-30` | Run for a specific week instead of the most recent Sunday |
+| `-NoPrompt` | Unattended — assumes GIS files are already in place |
+
+It suppresses system sleep for the life of the window using a user-level
+API call, which works even where `powercfg` is blocked by group policy.
+
+### One-time setup before the first Monday run
+
+The `v1` phase needs to know where the signature window ends, because
+nothing in the v1 code records it. Advancing blindly could leave a silent
+gap, so the script skips v1 rather than guess. Seed it once:
+
+```powershell
+python build_signature_store.py       # rebuilds from the newest 45 parquets
+
+# Then tell run_monday.ps1 where that landed - the newest parquet date
+Set-Content data\state\v1_window_end.txt "2026-08-23"
+```
+
+After that the script maintains the file itself, stamping it after each
+day so an interrupted run resumes correctly. You can also pass
+`-V1From <YYYY-MM-DD>` to state it explicitly for one run.
 
 ---
 
@@ -295,11 +343,17 @@ parquets.
 
 After 10–15 weekly runs, in priority order:
 
-**1. The headline** — `data\outputs\consensus_report.csv` filtered to
-`CONSENSUS_TIER = both_high_confidence`. Two methodologically independent
-models, each passing four gates including two cross-run stability gates,
-converging on the same recommendation. Sort by `RECOMMENDATION_TYPE` and lead
-with `cross_feeder_likely_gis_error`.
+**1. The headline** — run `python build_deliverable.py` (the `consensus`
+phase does this automatically). It extracts the `both_high_confidence`
+tier from `consensus_report.csv` and splits it by recommendation type
+into `data\outputs\deliverables\`:
+
+| File | Who gets it |
+|---|---|
+| `action_cross_feeder.csv` | **Field team.** Both models agree the meter correlates with a transformer on a *different feeder* — hard to explain except as a GIS error. |
+| `action_new_assignment.csv` | **GIS team.** Meters with no transformer in GIS that clustered with mapped peers. First-time mappings, not disputes. |
+| `review_same_feeder.csv` | **Nobody, as an action list.** Validation candidates only — see the warning below. |
+| `README.txt` | Explains each file and who it goes to; safe to forward with them. |
 
 **2. The easy wins** — uncontroversial, build goodwill:
 

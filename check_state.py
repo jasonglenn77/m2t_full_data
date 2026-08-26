@@ -77,7 +77,7 @@ def report_local_only():
 
 
 def report_v2_ledger():
-    header("2. v2 pair ledger — your v2 resume point")
+    header("2. v2 pair ledger - your v2 resume point")
     if not os.path.exists(LEDGER_PATH):
         print("  No ledger found. v2 would build one from scratch.")
         return None
@@ -148,7 +148,7 @@ def detect_v1_window_end(max_candidates, n_sample=4):
     """Nothing records which day the v1 signature store ends on, so
     identify it by matching the store's newest 96 columns against the
     daily parquets, newest first."""
-    header("3. v1 signature store — detecting window end")
+    header("3. v1 signature store - detecting window end")
     if not os.path.exists(SIG_PATH) or not os.path.exists(BADGE_IDS_PATH):
         print("  Signature store not present; skipping (v1 unavailable).")
         return None
@@ -288,7 +288,7 @@ def report_gis():
         mtime = pd.Timestamp(os.path.getmtime(km), unit="s")
         print(f"\n  known_mapping.csv last rebuilt: {mtime:%Y-%m-%d %H:%M}")
     else:
-        print("\n  known_mapping.csv missing — run build_known_mapping.py")
+        print("\n  known_mapping.csv missing - run build_known_mapping.py")
 
 
 def report_runs():

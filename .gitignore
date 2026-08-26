@@ -22,3 +22,7 @@ data/processed/signatures/signatures.npy.tmp
 # Per-week output snapshots from run_weeks.ps1 (~45 MB/week; local history,
 # not source). Keep them on the machine that runs the model.
 data/archive_v2/
+
+# Where run_monday.ps1 tracks the v1 signature window. Machine-specific,
+# like the ledger position — committing it would desync the two machines.
+data/state/v1_window_end.txt
