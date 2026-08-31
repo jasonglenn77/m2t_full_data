@@ -162,6 +162,7 @@ if ($DryRun) {
 
 Suspend-Sleep
 $started = Get-Date
+$script:v1Skipped = $false
 
 # -------------------------------------------------------------- 1. GIS
 if ((Test-Phase "gis") -and -not $SkipGis) {
@@ -220,6 +221,7 @@ if ((Test-Phase "v1") -and -not $SkipV1) {
     }
 
     if ($from -eq "") {
+        $script:v1Skipped = $true
         Write-Host "v1 window position is unknown, so advancing it could silently" -ForegroundColor DarkYellow
         Write-Host "leave a gap. Skipping the v1 phase." -ForegroundColor DarkYellow
         Write-Host ""
@@ -259,8 +261,25 @@ if ((Test-Phase "v1") -and -not $SkipV1) {
 # -------------------------------------------------------- 5. CONSENSUS
 if ((Test-Phase "consensus") -and -not $SkipV1) {
     Write-Section "Phase 5/6 - Consensus report and deliverable"
-    Invoke-Step "consensus_report" "python" @("consensus_report.py")
-    Invoke-Step "build deliverables" "python" @("build_deliverable.py")
+
+    if ($script:v1Skipped) {
+        # consensus_report.py merges whatever v1 outputs are on disk. With v1
+        # skipped those are stale, and the result would look authoritative
+        # while being half old data. Refuse rather than mislead.
+        Write-Host "SKIPPING consensus: the v1 phase did not run, so v1's outputs" -ForegroundColor Red
+        Write-Host "are stale. A consensus report built from them would merge" -ForegroundColor Red
+        Write-Host "current v2 against months-old v1 and look authoritative." -ForegroundColor Red
+        Write-Host ""
+        Write-Host "Seed v1 (see the message above), then run:" -ForegroundColor Red
+        Write-Host "  .\run_monday.ps1 -StartAt v1" -ForegroundColor Red
+        Write-Host ""
+        Write-Host "This week's v2 outputs are complete and usable on their own:" -ForegroundColor DarkYellow
+        Write-Host "  data\outputs_v2\corrections_high_confidence_enriched.csv" -ForegroundColor DarkYellow
+    }
+    else {
+        Invoke-Step "consensus_report" "python" @("consensus_report.py")
+        Invoke-Step "build deliverables" "python" @("build_deliverable.py")
+    }
 }
 
 # ----------------------------------------------------------- 6. VERIFY
