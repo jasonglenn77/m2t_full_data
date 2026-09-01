@@ -251,22 +251,29 @@ def main():
         "V2_PEER_STABILITY",
         "V2_RECOMMENDATION_STABILITY",
     ]
-    cols_final = [c for c in preferred if c in merged.columns] + [
-        c for c in merged.columns if c not in preferred
-    ]
-
-    # Combine CURRENT_TRANSFORMER from v1 and v2 (they should agree; v1 wins ties)
+    # Combine CURRENT_TRANSFORMER from v1 and v2 (they should agree; v1 wins
+    # ties). This MUST happen before cols_final is built: CURRENT_TRANSFORMER
+    # is in `preferred`, but if it does not exist yet when cols_final is
+    # computed it gets filtered straight back out, and the report ships
+    # telling the field team where to move a meter without saying what it is
+    # currently assigned to.
+    drop_cols = []
     if "V1_CURRENT_TRANSFORMER" in merged.columns and "V2_CURRENT_TRANSFORMER" in merged.columns:
         merged["CURRENT_TRANSFORMER"] = merged["V1_CURRENT_TRANSFORMER"].combine_first(
             merged["V2_CURRENT_TRANSFORMER"]
         )
-        cols_final = [c for c in cols_final if c not in ("V1_CURRENT_TRANSFORMER", "V2_CURRENT_TRANSFORMER")]
+        drop_cols = ["V1_CURRENT_TRANSFORMER", "V2_CURRENT_TRANSFORMER"]
     elif "V1_CURRENT_TRANSFORMER" in merged.columns:
         merged["CURRENT_TRANSFORMER"] = merged["V1_CURRENT_TRANSFORMER"]
-        cols_final = [c for c in cols_final if c != "V1_CURRENT_TRANSFORMER"]
+        drop_cols = ["V1_CURRENT_TRANSFORMER"]
     elif "V2_CURRENT_TRANSFORMER" in merged.columns:
         merged["CURRENT_TRANSFORMER"] = merged["V2_CURRENT_TRANSFORMER"]
-        cols_final = [c for c in cols_final if c != "V2_CURRENT_TRANSFORMER"]
+        drop_cols = ["V2_CURRENT_TRANSFORMER"]
+
+    cols_final = [c for c in preferred if c in merged.columns] + [
+        c for c in merged.columns if c not in preferred
+    ]
+    cols_final = [c for c in cols_final if c not in drop_cols]
 
     merged = merged[cols_final]
 
