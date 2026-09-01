@@ -163,6 +163,7 @@ if ($DryRun) {
 Suspend-Sleep
 $started = Get-Date
 $script:v1Skipped = $false
+$script:consensusRan = $false
 
 # -------------------------------------------------------------- 1. GIS
 if ((Test-Phase "gis") -and -not $SkipGis) {
@@ -279,6 +280,7 @@ if ((Test-Phase "consensus") -and -not $SkipV1) {
     else {
         Invoke-Step "consensus_report" "python" @("consensus_report.py")
         Invoke-Step "build deliverables" "python" @("build_deliverable.py")
+        $script:consensusRan = $true
     }
 }
 
@@ -295,16 +297,33 @@ if (Test-Phase "verify") {
 Write-Section "Monday run complete - week ending $weekEndStr"
 Write-Host "Elapsed: $([int]((Get-Date) - $started).TotalMinutes) min"
 Write-Host ""
-Write-Host "Deliverables (see README.txt in that folder for who gets what):" -ForegroundColor Green
-Write-Host "  data\outputs\deliverables\action_cross_feeder.csv     field team, highest signal"
-Write-Host "  data\outputs\deliverables\action_new_assignment.csv   GIS team, easy wins"
-Write-Host "  data\outputs\deliverables\review_same_feeder.csv      validation candidates only"
-Write-Host ""
-Write-Host "Also for the GIS team:" -ForegroundColor Green
-Write-Host "  data\outputs_v2\badges_missing_from_gis.csv"
-Write-Host "  data\outputs_v2\latlon_discrepancies.csv"
-Write-Host ""
-Write-Host "Hold back: same_feeder_ambiguous rows (confirmed false positives)," -ForegroundColor DarkYellow
-Write-Host "and full_clusters_enriched.csv (internal join asset, 218K rows)." -ForegroundColor DarkYellow
+if ($script:consensusRan -and (Test-Path "data\outputs\deliverables\action_cross_feeder.csv")) {
+    Write-Host "Deliverables (see README.txt in that folder for who gets what):" -ForegroundColor Green
+    Write-Host "  data\outputs\deliverables\action_cross_feeder.csv     field team, highest signal"
+    Write-Host "  data\outputs\deliverables\action_new_assignment.csv   GIS team, easy wins"
+    Write-Host "  data\outputs\deliverables\review_same_feeder.csv      validation candidates only"
+    Write-Host ""
+    Write-Host "Also for the GIS team:" -ForegroundColor Green
+    Write-Host "  data\outputs_v2\badges_missing_from_gis.csv"
+    Write-Host "  data\outputs_v2\latlon_discrepancies.csv"
+    Write-Host ""
+    Write-Host "Hold back: same_feeder_ambiguous rows (confirmed false positives)," -ForegroundColor DarkYellow
+    Write-Host "and full_clusters_enriched.csv (internal join asset, 218K rows)." -ForegroundColor DarkYellow
+}
+else {
+    # Do not advertise deliverable paths that this run did not create --
+    # they either do not exist or are left over from an earlier run.
+    Write-Host "NO consensus deliverables were produced by this run." -ForegroundColor DarkYellow
+    Write-Host "data\outputs\deliverables\ was not written, because the v1 and" -ForegroundColor DarkYellow
+    Write-Host "consensus phases did not run." -ForegroundColor DarkYellow
+    Write-Host ""
+    Write-Host "What this run DID produce, complete and usable on its own:" -ForegroundColor Green
+    Write-Host "  data\outputs_v2\corrections_high_confidence_enriched.csv   v2 work list"
+    Write-Host "  data\outputs_v2\badges_missing_from_gis.csv                GIS team"
+    Write-Host "  data\outputs_v2\latlon_discrepancies.csv                   GIS team"
+    Write-Host ""
+    Write-Host "To produce the consensus deliverables, run:" -ForegroundColor Green
+    Write-Host "  .\run_monday.ps1 -StartAt v1 -WeekEnd $weekEndStr"
+}
 Write-Host ""
 Write-Host "Week archive: data\archive_v2\$weekEndStr"
