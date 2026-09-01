@@ -29,6 +29,30 @@ import pandas as pd
 CONSENSUS = "data/outputs/consensus_report.csv"
 OUT_DIR = "data/outputs/deliverables"
 
+# RECOMMENDATION_TYPE -> (priority, label shown in the combined file)
+# Priority is what a recipient should work first, not model confidence:
+# same_feeder rows can carry a perfect confidence gap and still be wrong,
+# because meters on a shared feeder look alike from voltage alone.
+PRIORITY = {
+    "cross_feeder_likely_gis_error": (
+        1,
+        "ACT FIRST - wrong feeder, likely GIS error",
+    ),
+    "new_assignment": (
+        2,
+        "ACT - meter unmapped in GIS, both models agree where it belongs",
+    ),
+    "unknown_feeder": (
+        3,
+        "GIS DATA GAP - feeder missing, cannot classify until GIS is fixed",
+    ),
+    "same_feeder_ambiguous": (
+        4,
+        "DO NOT ACT - same feeder, unverifiable from voltage; field-check only",
+    ),
+}
+UNKNOWN_PRIORITY = (9, "unclassified")
+
 # (RECOMMENDATION_TYPE, output filename, who it goes to)
 SPLITS = [
     (
@@ -95,10 +119,48 @@ def main():
 
     os.makedirs(args.out_dir, exist_ok=True)
 
+    # AGREED_CONFIDENCE_GAP: the LOWER of the two models' gaps, so the number
+    # reflects what both models will stand behind rather than the more
+    # optimistic one.
+    for col in ("V1_CONFIDENCE_GAP", "V2_CONFIDENCE_GAP"):
+        if col in tier.columns:
+            tier[col + "_NUM"] = pd.to_numeric(tier[col], errors="coerce")
+    gap_cols = [c for c in tier.columns if c.endswith("_CONFIDENCE_GAP_NUM")]
+    if gap_cols:
+        tier["AGREED_CONFIDENCE_GAP"] = tier[gap_cols].min(axis=1).round(4)
+        tier = tier.drop(columns=gap_cols)
+    else:
+        tier["AGREED_CONFIDENCE_GAP"] = pd.NA
+
+    if "RECOMMENDATION_TYPE" in tier.columns:
+        tier["ACTION_PRIORITY"] = tier["RECOMMENDATION_TYPE"].map(
+            lambda t: PRIORITY.get(t, UNKNOWN_PRIORITY)[0]
+        )
+        tier["ACTION"] = tier["RECOMMENDATION_TYPE"].map(
+            lambda t: PRIORITY.get(t, UNKNOWN_PRIORITY)[1]
+        )
+    else:
+        tier["ACTION_PRIORITY"] = UNKNOWN_PRIORITY[0]
+        tier["ACTION"] = UNKNOWN_PRIORITY[1]
+
+    tier = tier.sort_values(
+        ["ACTION_PRIORITY", "AGREED_CONFIDENCE_GAP"],
+        ascending=[True, False],
+        kind="stable",
+    )
+
+    # Put the routing columns first so the file explains itself on open.
+    lead = ["ACTION_PRIORITY", "ACTION", "RECOMMENDATION_TYPE",
+            "AGREED_CONFIDENCE_GAP", "BADGE", "CURRENT_TRANSFORMER",
+            "RECOMMENDED_TRANSFORMER"]
+    ordered = [c for c in lead if c in tier.columns]
+    tier = tier[ordered + [c for c in tier.columns if c not in ordered]]
+
     main_path = os.path.join(args.out_dir, "both_high_confidence.csv")
     tier.to_csv(main_path, index=False)
     print()
     print(f"Wrote {main_path}: {len(tier):,} rows")
+    print("  (single-file deliverable: sorted by ACTION_PRIORITY, then confidence)")
 
     readme = [
         "M2T model deliverables",
@@ -117,8 +179,25 @@ def main():
     has_type = "RECOMMENDATION_TYPE" in tier.columns
     if has_type and not tier.empty:
         print()
-        print("Recommendation type breakdown:")
-        print(tier["RECOMMENDATION_TYPE"].value_counts().to_string())
+        print("By action priority:")
+        summary = (
+            tier.groupby(["ACTION_PRIORITY", "ACTION"])
+            .size()
+            .reset_index(name="ROWS")
+            .sort_values("ACTION_PRIORITY")
+        )
+        for _, r in summary.iterrows():
+            print(f"  {r['ACTION_PRIORITY']}  {r['ROWS']:>6,}  {r['ACTION']}")
+
+        # How many same-feeder rows survive various confidence cutoffs. Useful
+        # when deciding whether to include any of them as a secondary tier.
+        sf = tier[tier["RECOMMENDATION_TYPE"] == "same_feeder_ambiguous"]
+        if not sf.empty and sf["AGREED_CONFIDENCE_GAP"].notna().any():
+            print()
+            print("same_feeder_ambiguous rows by AGREED_CONFIDENCE_GAP cutoff:")
+            for cut in (0.5, 0.6, 0.7, 0.8, 0.9, 1.0):
+                n = int((sf["AGREED_CONFIDENCE_GAP"] >= cut).sum())
+                print(f"  >= {cut:.1f} : {n:>6,}")
         print()
 
     for rec_type, filename, note in SPLITS:
