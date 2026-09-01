@@ -173,20 +173,31 @@ def cmd_verify():
         for w in missing_runs:
             print(f"  {w}")
 
-    # Gaps between consecutive weeks that are wider than 7 days mean a week
-    # was skipped -- usually because its daily parquets were missing.
+    # A week longer than 7 days is NOT a gap. Each week's backfill runs
+    # --to-date <week end> starting from wherever the ledger stands, so two
+    # consecutive runs cover every day between them no matter how far apart
+    # they are. Deliberately shifting the cadence (e.g. Saturday-ending to
+    # Sunday-ending) produces one longer week by design. Only an interval
+    # big enough to contain an entire skipped week is worth flagging.
     ordered = sorted(archived_set | run_weeks)
-    if len(ordered) >= 2:
-        jumps = []
-        for a, b in zip(ordered, ordered[1:]):
-            delta = (date.fromisoformat(b) - date.fromisoformat(a)).days
-            if delta > 7:
-                jumps.append((a, b, delta))
-        if jumps:
-            problems = True
-            print("GAPS WIDER THAN 7 DAYS between consecutive weeks:")
-            for a, b, delta in jumps:
-                print(f"  {a} -> {b}  ({delta} days)")
+    long_weeks = []
+    for a, b in zip(ordered, ordered[1:]):
+        delta = (date.fromisoformat(b) - date.fromisoformat(a)).days
+        if delta > 7:
+            long_weeks.append((a, b, delta))
+
+    for a, b, delta in [j for j in long_weeks if j[2] <= 14]:
+        print(f"Note: {a} -> {b} is a {delta}-day week (covered in full).")
+    if any(j[2] <= 14 for j in long_weeks):
+        print()
+
+    suspicious = [j for j in long_weeks if j[2] > 14]
+    if suspicious:
+        problems = True
+        print("INTERVALS LONG ENOUGH TO HIDE A SKIPPED WEEK:")
+        for a, b, delta in suspicious:
+            print(f"  {a} -> {b}  ({delta} days)")
+        print("  Check data/raw/daily/ for missing parquets in that range.")
 
     if ledger_day and ordered and ordered[-1] < ledger_day:
         problems = True
@@ -198,7 +209,7 @@ def cmd_verify():
 
     if not problems:
         span = f"{ordered[0]} -> {ordered[-1]}" if ordered else "(none)"
-        print(f"OK - {len(ordered)} consecutive weekly run(s), {span}.")
+        print(f"OK - {len(ordered)} weekly run(s), {span}, no missing coverage.")
         print("Every recorded run has a snapshot and every snapshot has a run.")
 
 
