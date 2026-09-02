@@ -213,10 +213,17 @@ def write_full_list(df, out_dir):
 
     path = os.path.join(out_dir, "full_difference_list.csv")
     full.to_csv(path, index=False)
+    n_meters = full["BADGE"].nunique() if "BADGE" in full.columns else len(full)
     print()
-    print(f"Wrote {path}: {len(full):,} rows")
+    print(f"Wrote {path}: {len(full):,} rows, {n_meters:,} distinct meters")
     print("  Complete record of every model/GIS disagreement, ranked by")
     print("  strength of evidence then field priority.")
+    if len(full) != n_meters:
+        # One row per (meter, recommended transformer). A meter appears twice
+        # when the two versions name different transformers for it -- worth
+        # stating, because rows and meters get quoted interchangeably.
+        print(f"  ({len(full) - n_meters:,} meters carry two recommendations,")
+        print("   one from each version, so rows exceed meters.)")
 
     print()
     print("Full population by strength of evidence:")
