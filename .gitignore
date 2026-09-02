@@ -26,3 +26,9 @@ data/archive_v2/
 # Where run_monday.ps1 tracks the v1 signature window. Machine-specific,
 # like the ledger position — committing it would desync the two machines.
 data/state/v1_window_end.txt
+
+# Reconciliation ledger and ignore lists are machine-local operational state:
+# they record what THIS machine has delivered and what the field has since
+# confirmed. Committing them would desync the two machines.
+data/state/reconciliation_ledger.csv
+data/state/corrections_ignored_v2.csv
