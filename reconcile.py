@@ -40,9 +40,24 @@ from datetime import date
 import pandas as pd
 
 LEDGER = "data/state/reconciliation_ledger.csv"
+HISTORY = "data/state/reconciliation_history.csv"
 FIELD_LIST = "data/outputs/deliverables/field_verification_list.csv"
 KNOWN_MAPPING = "data/outputs/known_mapping.csv"
 OUT_DIR = "data/outputs/deliverables"
+
+HISTORY_COLS = [
+    "WEEK",
+    "ON_RECORD",
+    "OPEN",
+    "FIXED_IN_GIS",
+    "GIS_CONFIRMED_CORRECT",
+    "FIELD_FOUND_OTHER",
+    "LAPSED",
+    "FIELD_VERIFIED_TOTAL",
+    "RECONCILED_PCT",
+    "NEW_THIS_WEEK",
+    "RESOLVED_THIS_WEEK",
+]
 
 LEDGER_COLS = [
     "BADGE",
@@ -59,7 +74,9 @@ LEDGER_COLS = [
 OPEN = "OPEN"
 RESOLVED = "RESOLVED_GIS_UPDATED"
 CONFIRMED = "CLOSED_GIS_CONFIRMED"
+FIELD_OTHER = "CLOSED_FIELD_FOUND_OTHER"
 LAPSED = "LAPSED"
+CLOSED_STATUSES = (RESOLVED, CONFIRMED, FIELD_OTHER)
 
 
 def norm(series):
@@ -142,7 +159,7 @@ def main():
     for key, i in index.items():
         badge, rec_tx = key
         status = ledger.at[i, "STATUS"]
-        if status in (RESOLVED, CONFIRMED):
+        if status in CLOSED_STATUSES:
             continue
         if rec_tx and gis.get(badge, "") == rec_tx:
             ledger.at[i, "STATUS"] = RESOLVED
@@ -168,7 +185,7 @@ def main():
                 ledger.at[i, "STATUS"] = OPEN
                 ledger.at[i, "NOTES"] = "reopened - flagged again"
                 n_reopened += 1
-            if ledger.at[i, "STATUS"] not in (RESOLVED, CONFIRMED):
+            if ledger.at[i, "STATUS"] not in CLOSED_STATUSES:
                 ledger.at[i, "LAST_DELIVERED"] = week
                 ledger.at[i, "FIELD_PRIORITY"] = r.get("FIELD_PRIORITY", "")
         else:
@@ -217,27 +234,83 @@ def main():
 
     counts = ledger["STATUS"].value_counts()
     total = len(ledger)
-    closed = int(counts.get(RESOLVED, 0)) + int(counts.get(CONFIRMED, 0))
+    n_fixed = int(counts.get(RESOLVED, 0))
+    n_confirmed = int(counts.get(CONFIRMED, 0))
+    n_other = int(counts.get(FIELD_OTHER, 0))
+    # Anything a crew physically went and looked at, whatever the verdict.
+    verified = n_confirmed + n_other
+    closed = n_fixed + n_confirmed + n_other
 
     lines = [
         f"M2T reconciliation summary - {week}",
-        "=" * 56,
+        "=" * 58,
         "",
-        f"Recommendations ever delivered : {total:,}",
-        f"  Resolved, GIS updated        : {int(counts.get(RESOLVED, 0)):,}",
-        f"  Closed, GIS confirmed correct: {int(counts.get(CONFIRMED, 0)):,}",
-        f"  Still open                   : {int(counts.get(OPEN, 0)):,}",
-        f"  Lapsed (no longer flagged)   : {int(counts.get(LAPSED, 0)):,}",
+        f"Recommendations ever delivered   : {total:,}",
         "",
-        f"Reconciled: {closed:,} of {total:,}"
+        "  VERDICTS",
+        f"    Fixed in GIS (model was right) : {n_fixed:,}",
+        f"    GIS confirmed correct          : {n_confirmed:,}",
+        f"    Field found a third transformer: {n_other:,}",
+        f"    Still open                     : {int(counts.get(OPEN, 0)):,}",
+        f"    Lapsed (no longer flagged)     : {int(counts.get(LAPSED, 0)):,}",
+        "",
+        f"  Field-verified to date           : {verified:,}",
+        f"  Reconciled                       : {closed:,} of {total:,}"
         + (f" ({100 * closed / total:.1f}%)" if total else ""),
         "",
-        f"Newly resolved since last run  : {len(newly_resolved):,}",
-        f"New recommendations this run   : {n_new:,}",
-        f"Reopened this run              : {n_reopened:,}",
-        f"Lapsed this run                : {n_lapsed:,}",
+        "  THIS RUN",
+        f"    Newly fixed in GIS             : {len(newly_resolved):,}",
+        f"    New recommendations            : {n_new:,}",
+        f"    Reopened                       : {n_reopened:,}",
+        f"    Lapsed                         : {n_lapsed:,}",
         "",
     ]
+
+    # --- Append this week to the running history ----------------------
+    row = {
+        "WEEK": week,
+        "ON_RECORD": total,
+        "OPEN": int(counts.get(OPEN, 0)),
+        "FIXED_IN_GIS": n_fixed,
+        "GIS_CONFIRMED_CORRECT": n_confirmed,
+        "FIELD_FOUND_OTHER": n_other,
+        "LAPSED": int(counts.get(LAPSED, 0)),
+        "FIELD_VERIFIED_TOTAL": verified,
+        "RECONCILED_PCT": round(100 * closed / total, 2) if total else 0.0,
+        "NEW_THIS_WEEK": n_new,
+        "RESOLVED_THIS_WEEK": len(newly_resolved),
+    }
+    hist = pd.DataFrame(columns=HISTORY_COLS)
+    if os.path.exists(HISTORY):
+        hist = pd.read_csv(HISTORY, dtype=str)
+        for c in HISTORY_COLS:
+            if c not in hist.columns:
+                hist[c] = ""
+        hist = hist[HISTORY_COLS]
+        hist = hist[hist["WEEK"] != week]          # re-running a week replaces it
+    hist = pd.concat([hist, pd.DataFrame([row])], ignore_index=True)
+    hist = hist.sort_values("WEEK", kind="stable")
+    hist.to_csv(HISTORY, index=False)
+
+    if len(hist) > 1:
+        lines.append("  WEEK OVER WEEK")
+        lines.append(
+            "    {:<12}{:>9}{:>9}{:>10}{:>8}".format(
+                "week", "open", "fixed", "verified", "recon%"
+            )
+        )
+        for _, h in hist.tail(12).iterrows():
+            lines.append(
+                "    {:<12}{:>9}{:>9}{:>10}{:>8}".format(
+                    str(h["WEEK"]),
+                    f"{int(float(h['OPEN'])):,}",
+                    f"{int(float(h['FIXED_IN_GIS'])):,}",
+                    f"{int(float(h['FIELD_VERIFIED_TOTAL'])):,}",
+                    f"{float(h['RECONCILED_PCT']):.1f}",
+                )
+            )
+        lines.append("")
+
     summary = "\n".join(lines)
     with open(os.path.join(OUT_DIR, "reconciliation_summary.txt"), "w",
               encoding="utf-8") as fh:
@@ -246,6 +319,7 @@ def main():
     print()
     print(summary)
     print(f"Ledger:   {LEDGER}")
+    print(f"History:  {HISTORY}")
     print(f"Resolved: {resolved_path}")
 
 

@@ -213,6 +213,82 @@ def cmd_verify():
         print("Every recorded run has a snapshot and every snapshot has a run.")
 
 
+def cmd_trend(out_path):
+    """Week-over-week movement in the disagreement population -- the view for
+    showing whether the model is converging, and where the work is going."""
+    sources = week_sources()
+    if not sources:
+        raise SystemExit(f"No week archives in {ARCHIVE_DIR}/.")
+
+    rows = []
+    for week, source in sources:
+        row = {"WEEK": week}
+        ranked = read_member(source, "corrections_ranked.csv")
+        row["FLAGGED"] = len(ranked) if ranked is not None else None
+
+        hc = read_member(source, "corrections_high_confidence_enriched.csv")
+        if hc is None:
+            rows.append(row)
+            continue
+        row["HIGH_CONF"] = len(hc)
+        if "RECOMMENDATION_TYPE" in hc.columns:
+            counts = hc["RECOMMENDATION_TYPE"].value_counts()
+            row["CROSS_FEEDER"] = int(counts.get("cross_feeder_likely_gis_error", 0))
+            row["NEW_ASSIGN"] = int(counts.get("new_assignment", 0))
+            row["SAME_FEEDER"] = int(counts.get("same_feeder_ambiguous", 0))
+        rows.append(row)
+
+    df = pd.DataFrame(rows)
+    cols = ["WEEK", "FLAGGED", "HIGH_CONF", "CROSS_FEEDER", "NEW_ASSIGN",
+            "SAME_FEEDER"]
+    df = df[[c for c in cols if c in df.columns]]
+
+    # Change vs the previous week, which is what a stakeholder actually reads.
+    for c in ("FLAGGED", "HIGH_CONF"):
+        if c in df.columns:
+            df[c + "_CHG"] = df[c].diff()
+
+    print(f"Disagreement population across {len(df)} weekly run(s)\n")
+    header = "{:<12}{:>10}{:>8}{:>11}{:>8}{:>8}{:>8}{:>8}".format(
+        "week", "flagged", "chg", "high-conf", "chg", "x-feed", "new", "same"
+    )
+    print(header)
+    print("-" * len(header))
+    for _, r in df.iterrows():
+        def fmt(v, signed=False):
+            if pd.isna(v):
+                return "-"
+            v = int(v)
+            return f"{v:+,}" if signed else f"{v:,}"
+        print(
+            "{:<12}{:>10}{:>8}{:>11}{:>8}{:>8}{:>8}{:>8}".format(
+                r["WEEK"],
+                fmt(r.get("FLAGGED")),
+                fmt(r.get("FLAGGED_CHG"), True),
+                fmt(r.get("HIGH_CONF")),
+                fmt(r.get("HIGH_CONF_CHG"), True),
+                fmt(r.get("CROSS_FEEDER")),
+                fmt(r.get("NEW_ASSIGN")),
+                fmt(r.get("SAME_FEEDER")),
+            )
+        )
+
+    if len(df) >= 2 and "HIGH_CONF" in df.columns:
+        first, last = df["HIGH_CONF"].iloc[0], df["HIGH_CONF"].iloc[-1]
+        recent = df["HIGH_CONF"].tail(4)
+        spread = int(recent.max() - recent.min()) if len(recent) > 1 else 0
+        print()
+        print(f"High-confidence: {int(first):,} -> {int(last):,} "
+              f"({int(last - first):+,} across the series)")
+        print(f"Last {len(recent)} weeks span {spread:,} rows "
+              f"-- a small spread means the model has converged.")
+
+    if out_path:
+        os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+        df.to_csv(out_path, index=False)
+        print(f"\nWrote {out_path}")
+
+
 def stack(filename):
     sources = week_sources()
     if not sources:
@@ -305,6 +381,11 @@ def main():
         "--list", action="store_true", help="List archived weeks and available files."
     )
     parser.add_argument(
+        "--trend",
+        action="store_true",
+        help="Week-over-week movement in the disagreement population.",
+    )
+    parser.add_argument(
         "--verify",
         action="store_true",
         help="Check that no week was lost: archives vs recorded runs vs ledger.",
@@ -331,6 +412,8 @@ def main():
 
     if args.list:
         cmd_list()
+    elif args.trend:
+        cmd_trend(args.out)
     elif args.verify:
         cmd_verify()
     elif args.badge_trend:

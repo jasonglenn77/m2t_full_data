@@ -42,9 +42,11 @@ import pandas as pd
 IGNORE_V1 = "data/state/corrections_ignored.csv"
 IGNORE_V2 = "data/state/corrections_ignored_v2.csv"
 LEDGER = "data/state/reconciliation_ledger.csv"
+FIELD_LIST = "data/outputs/deliverables/field_verification_list.csv"
 IGNORE_COLS = ["BADGE", "RECOMMENDED_TRANSFORMER", "DATE_ADDED", "NOTES"]
 
 CONFIRMED = "CLOSED_GIS_CONFIRMED"
+FIELD_OTHER = "CLOSED_FIELD_FOUND_OTHER"
 
 
 def norm(series):
@@ -90,7 +92,8 @@ def append_ignores(path, new_rows, dry_run):
     return len(fresh)
 
 
-def update_ledger(keys, week, dry_run):
+def update_ledger(outcomes, week, dry_run):
+    """outcomes: {(badge, rec_tx): (status, note)}"""
     if not os.path.exists(LEDGER):
         print(f"  {LEDGER} not found - skipping ledger update.")
         return
@@ -98,19 +101,65 @@ def update_ledger(keys, week, dry_run):
     led["BADGE"] = norm(led["BADGE"])
     led["RECOMMENDED_TRANSFORMER"] = norm(led["RECOMMENDED_TRANSFORMER"])
 
-    n = 0
+    counts = {}
     for i, r in led.iterrows():
-        if (r["BADGE"], r["RECOMMENDED_TRANSFORMER"]) in keys:
-            if r["STATUS"] != CONFIRMED:
-                led.at[i, "STATUS"] = CONFIRMED
-                led.at[i, "CLOSED_WEEK"] = week
-                led.at[i, "NOTES"] = "field visit confirmed the GIS record"
-                n += 1
-    if dry_run:
-        print(f"  {LEDGER}: WOULD close {n:,} row(s)")
-        return
-    led.to_csv(LEDGER, index=False)
-    print(f"  {LEDGER}: closed {n:,} row(s) as {CONFIRMED}")
+        key = (r["BADGE"], r["RECOMMENDED_TRANSFORMER"])
+        if key not in outcomes:
+            continue
+        status, note = outcomes[key]
+        if r["STATUS"] != status:
+            led.at[i, "STATUS"] = status
+            led.at[i, "CLOSED_WEEK"] = week
+            led.at[i, "NOTES"] = note
+            counts[status] = counts.get(status, 0) + 1
+
+    verb = "WOULD close" if dry_run else "closed"
+    if not counts:
+        print(f"  {LEDGER}: nothing to update")
+    for status, n in counts.items():
+        print(f"  {LEDGER}: {verb} {n:,} row(s) as {status}")
+    if not dry_run:
+        led.to_csv(LEDGER, index=False)
+
+
+def fill_missing_columns(df):
+    """Accept a minimal returned sheet -- BADGE plus FIELD_CONFIRMED_TRANSFORMER
+    -- by recovering CURRENT/RECOMMENDED from this week's field list, then the
+    ledger. Crews often send back a trimmed spreadsheet rather than the whole
+    file, and rejecting that would put the friction in the wrong place."""
+    need = [c for c in ("CURRENT_TRANSFORMER", "RECOMMENDED_TRANSFORMER")
+            if c not in df.columns or (df[c] == "").all()]
+    if not need:
+        return df
+
+    lookup = None
+    if os.path.exists(FIELD_LIST):
+        src = pd.read_csv(FIELD_LIST, dtype=str).fillna("")
+        src["BADGE"] = norm(src["BADGE"])
+        lookup = src.drop_duplicates(subset=["BADGE"], keep="first").set_index("BADGE")
+        source_name = FIELD_LIST
+    elif os.path.exists(LEDGER):
+        src = pd.read_csv(LEDGER, dtype=str).fillna("")
+        src["BADGE"] = norm(src["BADGE"])
+        src = src.rename(columns={"GIS_AT_FIRST_DELIVERY": "CURRENT_TRANSFORMER"})
+        lookup = src.drop_duplicates(subset=["BADGE"], keep="first").set_index("BADGE")
+        source_name = LEDGER
+    if lookup is None:
+        raise SystemExit(
+            "The sheet is missing CURRENT_TRANSFORMER / RECOMMENDED_TRANSFORMER "
+            f"and neither {FIELD_LIST} nor {LEDGER} is available to recover them."
+        )
+
+    print(f"  Recovering {need} from {source_name}")
+    for c in need:
+        if c in lookup.columns:
+            df[c] = df["BADGE"].map(lookup[c]).fillna("")
+        else:
+            df[c] = ""
+    unmatched = int((df["RECOMMENDED_TRANSFORMER"] == "").sum())
+    if unmatched:
+        print(f"  WARNING: {unmatched:,} badge(s) not found; those rows are skipped.")
+    return df[df["RECOMMENDED_TRANSFORMER"] != ""].copy()
 
 
 def main():
@@ -134,17 +183,16 @@ def main():
         raise SystemExit(f"{args.sheet} not found.")
 
     df = pd.read_csv(args.sheet, dtype=str).fillna("")
-    required = {"BADGE", "CURRENT_TRANSFORMER", "RECOMMENDED_TRANSFORMER",
-                "FIELD_CONFIRMED_TRANSFORMER"}
-    missing = required - set(df.columns)
-    if missing:
-        raise SystemExit(
-            f"{args.sheet} is missing required column(s): {sorted(missing)}. "
-            "Expected the field_verification_list.csv layout."
-        )
+    for c in ("BADGE", "FIELD_CONFIRMED_TRANSFORMER"):
+        if c not in df.columns:
+            raise SystemExit(
+                f"{args.sheet} must contain at least BADGE and "
+                f"FIELD_CONFIRMED_TRANSFORMER. Missing: {c}"
+            )
+        df[c] = norm(df[c])
 
-    for c in ("BADGE", "CURRENT_TRANSFORMER", "RECOMMENDED_TRANSFORMER",
-              "FIELD_CONFIRMED_TRANSFORMER"):
+    df = fill_missing_columns(df)
+    for c in ("CURRENT_TRANSFORMER", "RECOMMENDED_TRANSFORMER"):
         df[c] = norm(df[c])
 
     done = df[df["FIELD_CONFIRMED_TRANSFORMER"] != ""].copy()
@@ -197,11 +245,19 @@ def main():
 
     print()
     print("Reconciliation ledger:")
-    update_ledger(
-        set(zip(gis_right["BADGE"], gis_right["RECOMMENDED_TRANSFORMER"])),
-        args.date,
-        args.dry_run,
-    )
+    outcomes = {}
+    for _, r in gis_right.iterrows():
+        outcomes[(r["BADGE"], r["RECOMMENDED_TRANSFORMER"])] = (
+            CONFIRMED,
+            "field visit confirmed the GIS record",
+        )
+    for _, r in neither.iterrows():
+        outcomes[(r["BADGE"], r["RECOMMENDED_TRANSFORMER"])] = (
+            FIELD_OTHER,
+            f"field found {r['FIELD_CONFIRMED_TRANSFORMER']} - "
+            f"neither GIS nor the model",
+        )
+    update_ledger(outcomes, args.date, args.dry_run)
 
     if not neither.empty:
         out = "data/outputs/deliverables/field_found_third_transformer.csv"
