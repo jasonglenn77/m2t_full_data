@@ -118,6 +118,77 @@ SPLITS = [
 ]
 
 
+V2_ENRICHED = "data/outputs_v2/corrections_with_stability_enriched.csv"
+V1_ENRICHED = "data/outputs/corrections_with_stability_enriched.csv"
+JOIN_KEY = ["BADGE", "RECOMMENDED_TRANSFORMER"]
+
+
+def norm_id(series):
+    return (
+        series.astype(str)
+        .str.strip()
+        .str.replace(r"\.0+$", "", regex=True)
+        .replace({"nan": "", "None": "", "<NA>": ""})
+    )
+
+
+def attach_enrichment(df):
+    """Carry the full GIS context through from the per-model enriched outputs.
+
+    consensus_report.py keeps a subset -- enough to decide what to work, but
+    not enough to load into a GIS application. The coordinates needed to place
+    a record (GIS_BADGE_LAT/LON, *_TX_LAT/LON) and the keys needed to join it
+    to a GIS feature (BADGE_SPID, *_TX_LID, *_TX_STRUCTNO) all live only in
+    the enriched files. Without them the recipient has to work from a second,
+    parallel export, which defeats having one list.
+
+    v2 is preferred where both models produced a row; v1 fills in the rest.
+    """
+    frames = []
+    for path in (V2_ENRICHED, V1_ENRICHED):
+        if not os.path.exists(path):
+            continue
+        enr = pd.read_csv(path, dtype=str)
+        if not set(JOIN_KEY).issubset(enr.columns):
+            continue
+        for c in JOIN_KEY:
+            enr[c] = norm_id(enr[c])
+        frames.append(enr)
+
+    if not frames:
+        print("  No enriched model outputs found - GIS context columns omitted.")
+        return df
+
+    combined = pd.concat(frames, ignore_index=True, sort=False)
+    combined = combined.drop_duplicates(subset=JOIN_KEY, keep="first")
+
+    for c in JOIN_KEY:
+        df[c] = norm_id(df[c])
+    new_cols = [c for c in combined.columns
+                if c not in df.columns and c not in JOIN_KEY]
+    if not new_cols:
+        return df
+
+    before = len(df)
+    df = df.merge(combined[JOIN_KEY + new_cols], on=JOIN_KEY, how="left")
+    if len(df) != before:
+        raise SystemExit(
+            f"Enrichment join changed the row count ({before:,} -> {len(df):,}). "
+            "The enriched outputs have duplicate (BADGE, RECOMMENDED_TRANSFORMER) "
+            "keys; investigate before shipping this file."
+        )
+    # Count a row as matched if ANY attached column landed. Testing a single
+    # column understates it: CURRENT_TX_* is legitimately blank on every
+    # new_assignment row, since those meters have no current transformer.
+    matched = int(df[new_cols].notna().any(axis=1).sum())
+    print(f"  Attached {len(new_cols)} GIS context column(s); "
+          f"{matched:,} of {len(df):,} rows matched")
+    if matched < len(df):
+        print(f"  {len(df) - matched:,} row(s) matched nothing - they will have "
+              "blank GIS context.")
+    return df
+
+
 def agreed_min(df, v1_col, v2_col, out_col):
     """Take the LOWER of the two versions' numbers, so the figure is the one
     both will stand behind rather than the more optimistic of the pair."""
@@ -360,6 +431,7 @@ def main():
         raise SystemExit("consensus_report.csv has no CONSENSUS_TIER column.")
 
     df = annotate(df)
+    df = attach_enrichment(df)
     os.makedirs(args.out_dir, exist_ok=True)
 
     tier = df[df["CONSENSUS_TIER"] == args.tier].copy()
