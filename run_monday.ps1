@@ -140,8 +140,12 @@ if ($StartAt -ne "") {
 Write-Section "Monday run - week of $weekStartStr through $weekEndStr"
 
 if ((Get-Date).DayOfWeek -ne "Monday" -and $WeekEnd -eq "") {
-    Write-Host "Note: today is $((Get-Date).DayOfWeek), not Monday. Using the most" -ForegroundColor DarkYellow
-    Write-Host "recent Sunday ($weekEndStr). Pass -WeekEnd to override." -ForegroundColor DarkYellow
+    # Sunday's reads are not processed until Monday, so a Tuesday run is the
+    # normal case rather than a late one. Any weekday works: the week is
+    # always the seven days ending on the most recent Sunday.
+    Write-Host "Running on $((Get-Date).DayOfWeek); using the week ending "  -NoNewline -ForegroundColor DarkGray
+    Write-Host "$weekEndStr." -ForegroundColor DarkGray
+    Write-Host "Pass -WeekEnd to process a different week." -ForegroundColor DarkGray
     Write-Host ""
 }
 
@@ -201,6 +205,14 @@ if ((Test-Phase "extract") -and -not $SkipExtract) {
           "datetime($($monday.Year),$($monday.Month),$($monday.Day),tzinfo=timezone.utc), " +
           "datetime($($sunday.Year),$($sunday.Month),$($sunday.Day),tzinfo=timezone.utc))"
     Invoke-Step "save_daily_data extract" "python" @("-c", $py)
+
+    # A day pulled before its reads finished processing lands short, is
+    # marked done, and is never re-extracted. Once the v2 ledger folds it in
+    # the damage is not reversible by re-extracting alone, so stop here
+    # rather than let it through.
+    Invoke-Step "Check the week's parquets are complete" "python" @(
+        "check_parquet_days.py", "--from", $weekStartStr, "--to", $weekEndStr
+    )
 }
 
 # --------------------------------------------------------------- 3. v2
