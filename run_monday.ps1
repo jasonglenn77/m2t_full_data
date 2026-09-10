@@ -297,18 +297,23 @@ if (Test-Phase "verify") {
 Write-Section "Monday run complete - week ending $weekEndStr"
 Write-Host "Elapsed: $([int]((Get-Date) - $started).TotalMinutes) min"
 Write-Host ""
-if ($script:consensusRan -and (Test-Path "data\outputs\deliverables\action_cross_feeder.csv")) {
-    Write-Host "Deliverables (see README.txt in that folder for who gets what):" -ForegroundColor Green
-    Write-Host "  data\outputs\deliverables\action_cross_feeder.csv     field team, highest signal"
-    Write-Host "  data\outputs\deliverables\action_new_assignment.csv   GIS team, easy wins"
-    Write-Host "  data\outputs\deliverables\review_same_feeder.csv      validation candidates only"
+if ($script:consensusRan -and (Test-Path "data\outputs\deliverables\field_verification_list.csv")) {
+    Write-Host "NEXT STEP - close the loop before you deliver:" -ForegroundColor Yellow
+    Write-Host "  python reconcile.py --week $weekEndStr"
+    Write-Host "  Detects what GIS has adopted since last week and writes"
+    Write-Host "  reconciliation_summary.txt, which is part of the delivery."
     Write-Host ""
-    Write-Host "Also for the GIS team:" -ForegroundColor Green
-    Write-Host "  data\outputs_v2\badges_missing_from_gis.csv"
-    Write-Host "  data\outputs_v2\latlon_discrepancies.csv"
+    Write-Host "Then attach these five files:" -ForegroundColor Green
+    Write-Host "  data\outputs\deliverables\field_verification_list.csv   the work list"
+    Write-Host "  data\outputs\deliverables\full_difference_list.csv      the full record"
+    Write-Host "  data\outputs\deliverables\README.txt                    how to work it"
+    Write-Host "  data\outputs_v2\badges_missing_from_gis.csv             GIS team, in office"
+    Write-Host "  data\outputs_v2\latlon_discrepancies.csv                GIS team, in office"
+    Write-Host "  (plus reconciliation_summary.txt once the step above has run)"
     Write-Host ""
-    Write-Host "Hold back: same_feeder_ambiguous rows (confirmed false positives)," -ForegroundColor DarkYellow
-    Write-Host "and full_clusters_enriched.csv (internal join asset, 218K rows)." -ForegroundColor DarkYellow
+    Write-Host "Every row in the work list is in field scope - priority orders it by" -ForegroundColor DarkGray
+    Write-Host "how much the model could resolve alone, not by what is worth visiting." -ForegroundColor DarkGray
+    Write-Host "Do not send full_clusters_enriched.csv (218K rows, internal join asset)." -ForegroundColor DarkGray
 }
 else {
     # Do not advertise deliverable paths that this run did not create --
