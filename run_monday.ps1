@@ -168,6 +168,7 @@ Suspend-Sleep
 $started = Get-Date
 $script:v1Skipped = $false
 $script:consensusRan = $false
+$script:v1AlreadyDone = $false
 
 # -------------------------------------------------------------- 1. GIS
 if ((Test-Phase "gis") -and -not $SkipGis) {
@@ -228,6 +229,21 @@ if (Test-Phase "v2") {
 if ((Test-Phase "v1") -and -not $SkipV1) {
     Write-Section "Phase 4/6 - v1 model"
 
+    # Bail out if this week's v1 run is already recorded. run_weeks.ps1 makes
+    # the equivalent check for v2, but without it here a re-run of a finished
+    # week re-clusters and overwrites corrections_ranked.csv, then dies at
+    # record_run.py's duplicate guard -- leaving data/outputs/ half from this
+    # run and half from the original. That guard stops the stability ledger
+    # being double-counted; it does not stop the overwrite that precedes it.
+    $v1RunId = "${weekEndStr}_weekly"
+    $v1Done = python -c "import os,sys,pandas as pd; p='data/state/history/runs.parquet'; sys.stdout.write('yes' if os.path.exists(p) and '$v1RunId' in set(pd.read_parquet(p)['RUN_ID']) else 'no')"
+    if ($LASTEXITCODE -eq 0 -and $v1Done.Trim() -eq "yes") {
+        Write-Host "v1 run '$v1RunId' is already recorded - skipping the v1 phase." -ForegroundColor DarkGray
+        Write-Host "Existing v1 outputs are left exactly as they are." -ForegroundColor DarkGray
+        $script:v1AlreadyDone = $true
+    }
+    else {
+
     $from = $V1From
     if ($from -eq "" -and (Test-Path $V1_STATE)) {
         $from = (Get-Content $V1_STATE -Raw).Trim()
@@ -268,6 +284,7 @@ if ((Test-Phase "v1") -and -not $SkipV1) {
         Invoke-Step "v1 record run"     "python" @("record_run.py", "${weekEndStr}_weekly")
         Invoke-Step "v1 stability"      "python" @("stability_report.py")
         Invoke-Step "v1 enrichment"     "python" @("enrich_outputs.py")
+    }
     }
 }
 
