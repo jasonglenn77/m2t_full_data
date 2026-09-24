@@ -198,21 +198,15 @@ if ((Test-Phase "gis") -and -not $SkipGis) {
 if ((Test-Phase "extract") -and -not $SkipExtract) {
     Write-Section "Phase 2/6 - Extract parquets for $weekStartStr .. $weekEndStr"
 
-    # Calls run_daily_extract directly so save_daily_data.py never needs
-    # its hardcoded dates edited. Days already marked done are skipped.
-    $py = "from datetime import datetime, timezone; " +
-          "from save_daily_data import run_daily_extract; " +
-          "run_daily_extract(" +
-          "datetime($($monday.Year),$($monday.Month),$($monday.Day),tzinfo=timezone.utc), " +
-          "datetime($($sunday.Year),$($sunday.Month),$($sunday.Day),tzinfo=timezone.utc))"
-    Invoke-Step "save_daily_data extract" "python" @("-c", $py)
-
-    # A day pulled before its reads finished processing lands short, is
-    # marked done, and is never re-extracted. Once the v2 ledger folds it in
-    # the damage is not reversible by re-extracting alone, so stop here
-    # rather than let it through.
-    Invoke-Step "Check the week's parquets are complete" "python" @(
-        "check_parquet_days.py", "--from", $weekStartStr, "--to", $weekEndStr
+    # extract_week.py validates each day against the size of known good days
+    # before recording it as done, and re-extracts any day already on disk
+    # that turns out to be short. A day pulled before its reads finished
+    # processing is therefore retried rather than silently kept -- which
+    # matters because once the v2 ledger folds a short day in, re-extracting
+    # alone will not repair it. Exits non-zero if any day is still unusable,
+    # stopping the run before the ledger sees it.
+    Invoke-Step "Extract and validate the week" "python" @(
+        "extract_week.py", "--from", $weekStartStr, "--to", $weekEndStr
     )
 }
 
