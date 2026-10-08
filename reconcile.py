@@ -121,8 +121,29 @@ def main():
         default=date.today().isoformat(),
         help="Run label, YYYY-MM-DD (default: today).",
     )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Reconcile even if the model has not recorded a run for --week.",
+    )
     args = parser.parse_args()
     week = args.week
+
+    # The field list on disk is whatever the last SUCCESSFUL run wrote. If the
+    # run for --week failed or has not happened yet, reconciling would compare
+    # an older list against this week's GIS and file the result under the
+    # wrong week. Only a completed pipeline records the v2 run, so require
+    # that record before trusting the field list to belong to this week.
+    runs_path = "data/state/history_v2/runs.parquet"
+    if not args.force and os.path.exists(runs_path):
+        recorded = set(pd.read_parquet(runs_path)["RUN_ID"])
+        if "v2_" + week not in recorded:
+            print(f"No completed model run is recorded for week {week}.")
+            print("The field list on disk belongs to an earlier week, so")
+            print(f"reconciling now would file that list under {week}.")
+            print("Finish run_monday.ps1 first, or pass --force if you")
+            print("really mean to reconcile the existing list.")
+            raise SystemExit(1)
 
     if not os.path.exists(FIELD_LIST):
         raise SystemExit(
